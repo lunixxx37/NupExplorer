@@ -31,7 +31,7 @@ mimetypes.add_type('application/javascript', '.mjs')
 mimetypes.add_type('text/css', '.css')
 mimetypes.add_type('image/svg+xml', '.svg')
 
-VERSION = '1.0.0'
+VERSION = '1.0.1'
 
 
 class State:
