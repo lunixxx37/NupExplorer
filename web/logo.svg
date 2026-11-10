@@ -1,0 +1,66 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#1d2737"/>
+      <stop offset="1" stop-color="#0a0d13"/>
+    </linearGradient>
+    <radialGradient id="floor" cx="0.5" cy="0.5" r="0.5">
+      <stop offset="0" stop-color="#12c8ff" stop-opacity="0.45"/>
+      <stop offset="1" stop-color="#12c8ff" stop-opacity="0"/>
+    </radialGradient>
+    <radialGradient id="glow" cx="0.5" cy="0.5" r="0.5">
+      <stop offset="0" stop-color="#ff4757" stop-opacity="0.55"/>
+      <stop offset="1" stop-color="#ff4757" stop-opacity="0"/>
+    </radialGradient>
+    <linearGradient id="rim" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#b4f6ff"/>
+      <stop offset="1" stop-color="#4fd8ff"/>
+    </linearGradient>
+    <linearGradient id="inside" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#03131d"/>
+      <stop offset="1" stop-color="#0b3a57"/>
+    </linearGradient>
+    <linearGradient id="left" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#2ccbff"/>
+      <stop offset="1" stop-color="#0a86e0"/>
+    </linearGradient>
+    <linearGradient id="right" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#0b7fd8"/>
+      <stop offset="1" stop-color="#05489a"/>
+    </linearGradient>
+    <linearGradient id="ctop" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#ffb0b7"/>
+      <stop offset="1" stop-color="#ff7480"/>
+    </linearGradient>
+    <linearGradient id="cleft" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#ff5a68"/>
+      <stop offset="1" stop-color="#e8283f"/>
+    </linearGradient>
+    <linearGradient id="cright" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#d8233b"/>
+      <stop offset="1" stop-color="#a3132b"/>
+    </linearGradient>
+    <clipPath id="opening"><path d="M128 86.4 L179.3 116 L128 145.6 L76.7 116 Z"/></clipPath>
+  </defs>
+  <rect width="256" height="256" rx="60" fill="url(#bg)"/>
+  <rect x="2" y="2" width="252" height="252" rx="58" fill="none" stroke="#ffffff" stroke-opacity="0.09" stroke-width="3"/>
+  <ellipse cx="128" cy="214" rx="86" ry="20" fill="url(#floor)"/>
+  <circle cx="128" cy="76" r="56" fill="url(#glow)"/>
+  <!-- box -->
+  <path d="M128 79 L192.1 116 L128 153 L63.9 116 Z" fill="url(#rim)"/>
+  <path d="M128 86.4 L179.3 116 L128 145.6 L76.7 116 Z" fill="url(#inside)"/>
+  <circle cx="128" cy="98" r="50" fill="url(#glow)" clip-path="url(#opening)"/>
+  <!-- item rising from the box -->
+  <path d="M106.35 66 L128 78.5 L128 103.5 L106.35 91 Z" fill="url(#cleft)"/>
+  <path d="M128 78.5 L149.65 66 L149.65 91 L128 103.5 Z" fill="url(#cright)"/>
+  <path d="M128 53.5 L149.65 66 L128 78.5 L106.35 66 Z" fill="url(#ctop)"/>
+  <!-- box sides -->
+  <path d="M63.9 116 L128 153 L128 215 L63.9 178 Z" fill="url(#left)"/>
+  <path d="M128 153 L192.1 116 L192.1 178 L128 215 Z" fill="url(#right)"/>
+  <path d="M63.9 116 L128 153 L192.1 116" fill="none" stroke="#ffffff" stroke-opacity="0.55" stroke-width="2.4" stroke-linejoin="round"/>
+  <path d="M128 153 L128 215" fill="none" stroke="#ffffff" stroke-opacity="0.18" stroke-width="2"/>
+  <!-- sparkles -->
+  <circle cx="86" cy="58" r="3.4" fill="#9ff0ff"/>
+  <circle cx="172" cy="44" r="2.6" fill="#ffffff" fill-opacity="0.85"/>
+  <circle cx="181" cy="74" r="2" fill="#9ff0ff" fill-opacity="0.8"/>
+</svg>

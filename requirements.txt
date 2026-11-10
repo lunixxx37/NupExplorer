@@ -1,0 +1,7 @@
+flask>=3.0
+numpy>=2.0
+pillow>=10.0
+texture2ddecoder>=1.0.5
+soundfile>=0.12
+# Python 3.14 ships compression.zstd; older versions need the zstandard package
+zstandard>=0.22; python_version < "3.14"

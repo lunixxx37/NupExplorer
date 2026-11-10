@@ -1,0 +1,43 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>NUP Explorer</title>
+<link rel="icon" type="image/svg+xml" href="logo.svg">
+<link rel="icon" type="image/png" sizes="256x256" href="icon-256.png">
+<link rel="stylesheet" href="app.css">
+<script type="importmap">
+{ "imports": { "three": "./vendor/three/build/three.module.min.js", "three/addons/": "./vendor/three/examples/jsm/" } }
+</script>
+<script type="module" src="js/main.js"></script>
+</head>
+<body>
+<header id="topbar">
+  <button id="btnHome" class="brand" title="Home"><img class="logo" src="logo.svg" alt=""><span class="brand-name"><b>NUP</b> Explorer</span></button>
+  <div id="nupinfo" class="file-chip hidden"></div>
+  <div class="spacer"></div>
+  <span id="conn" class="status-pill" title="Connection to the background process"><span class="dot"></span><span class="lbl">Connected</span></span>
+  <button id="btnOpen" class="btn"><span data-icon="open"></span>Open file…</button>
+  <button id="btnTarget" class="btn"><span data-icon="target"></span><span id="targetLabel">Export folder</span></button>
+</header>
+<main id="layout">
+  <aside id="sidebar" class="card">
+    <div id="searchbar">
+      <label class="search"><span data-icon="search"></span><input id="search" placeholder="Search… (e.g. kokiri bgm)" spellcheck="false" autocomplete="off"></label>
+      <select id="typefilter" class="sel" title="Type filter"></select>
+    </div>
+    <div id="tree" tabindex="0"></div>
+    <div id="treeinfo" class="muted small"></div>
+  </aside>
+  <div id="splitter" title="Drag to resize"></div>
+  <section id="content" class="card">
+    <div id="viewhead"></div>
+    <div id="viewer"></div>
+  </section>
+</main>
+<footer id="statusbar"></footer>
+<div id="ctxmenu" class="menu hidden"></div>
+<div id="toast"></div>
+</body>
+</html>

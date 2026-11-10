@@ -1,0 +1,16 @@
+# build output
+/build/
+/dist/
+
+# python
+__pycache__/
+*.py[cod]
+.venv/
+
+# local reports and logs
+QA_Modelle.md
+*.log
+
+# editors
+.vscode/
+.idea/
