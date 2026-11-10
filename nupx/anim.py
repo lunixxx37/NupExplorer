@@ -3,12 +3,16 @@
 Curve format of this BFRES revision (reverse engineered, differs from older BFRES):
   AnimCurve (0x30): u64 frames, u64 keys, u16 flags, u16 key_count, u32 target,
                     f32 start, f32 end, f32 frame_scale, f32 value_scale, f32 value_offset, pad
-  flags & 3        frame type: 0 f32, 1 u16 * frame_scale (1/32), 2 u8          (absolute frames)
+  flags & 3        frame type: 0 f32, 1 u16, 2 u8; u16 and u8 frames are multiplied by
+                   frame_scale when it is set (flag 0x0400), otherwise by 1/32 (u16) or 1 (u8)
   (flags>>2) & 3   key type:   0 f32, 1 u16, 2 u8                                (unsigned)
   (flags>>4) & 7   curve type: 0 cubic (Hermite)
-  flags & 0x0800   quantized keys: f32 slope_scale, f32 slope_offset, then key_count x (value_q, slope_q)
+  quantized keys   (key type 1/2, or flag 0x0800): f32 slope_scale, f32 slope_offset, then
+                   key_count x (value_q, slope_q)
                    value = value_offset + value_q * value_scale
                    slope = slope_offset + slope_q * slope_scale     (per frame)
+                   BFRES 10.4 (e.g. Ocarina of Time) sets flag 0x0800 on these curves, 10.2 (e.g.
+                   Mario Kart World) does not – the layout is the same.
   otherwise        key_count x (f32 value, f32 slope), no header
   Interpolation: cubic Hermite between keys; two keys on the same frame = jump.
   flags & 0x80     quaternion curve (rotation mode 0x2000/0x0000): target 0x20, keys are
@@ -147,7 +151,7 @@ def _read_curve(raw: bytes, co: int) -> Curve:
     elif ft == 1:
         frames = np.frombuffer(raw, '<u2', nk, fo).astype(np.float64) * (fscale or 1.0 / 32)
     elif ft == 2:
-        frames = np.frombuffer(raw, 'u1', nk, fo).astype(np.float64)
+        frames = np.frombuffer(raw, 'u1', nk, fo).astype(np.float64) * (fscale or 1.0)
     else:
         raise ValueError(f'Unknown frame type {ft}')
     kt = (fl >> 2) & 3
@@ -159,9 +163,7 @@ def _read_curve(raw: bytes, co: int) -> Curve:
         c.values = q / np.maximum(np.linalg.norm(q, axis=1, keepdims=True), 1e-12)
         c.slopes = None
         return c
-    if not fl & 0x0800:
-        if kt != 0:
-            raise ValueError(f'Curve format 0x{fl:04X} not supported')
+    if kt == 0 and not fl & 0x0800:
         q = np.frombuffer(raw, '<f4', 2 * nk, ko).astype(np.float64).reshape(nk, 2)
         c.values = q[:, 0].copy()
         c.slopes = q[:, 1].copy()
@@ -178,6 +180,44 @@ def _read_curve(raw: bytes, co: int) -> Curve:
     c.values = voff + q[:, 0] * vscale
     c.slopes = soff + q[:, 1] * sscale
     return c
+
+
+# animation arrays in the BFRES header: (array offset, dictionary offset) pairs
+SECTIONS = ((0x58, 'skeletal'), (0x68, 'material'), (0x78, 'bone visibility'), (0x88, 'shape'), (0x98, 'scene'))
+
+
+def sections(raw: bytes) -> dict[str, int]:
+    """Number of animations per kind, e.g. {'skeletal': 40} or {'material': 2}."""
+    out = {}
+    if raw[:4] != b'FRES':
+        return out
+    for off, name in SECTIONS:
+        arr, dic = struct.unpack_from('<QQ', raw, off)
+        n = _dict_count(raw, dic) if arr and 0 < dic <= len(raw) - 8 else 0
+        if n:
+            out[name] = n
+    return out
+
+
+def skeletal_bone_names(raw: bytes, max_clips: int = 8) -> set[str]:
+    """Bones animated by the first clips of a file (cheap: no curves are decoded)."""
+    names = set()
+    if raw[:4] != b'FRES':
+        return names
+    arr, dic = struct.unpack_from('<QQ', raw, 0x58)
+    for i in range(min(_dict_count(raw, dic) if arr else 0, max_clips)):
+        o = arr + i * 0x50
+        if raw[o:o + 4] != b'FSKA':
+            break
+        bone_arr = struct.unpack_from('<Q', raw, o + 0x28)[0]
+        for b in range(struct.unpack_from('<H', raw, o + 0x4C)[0]):
+            names.add(_str(raw, struct.unpack_from('<Q', raw, bone_arr + b * 0x38)[0]))
+    return names
+
+
+def has_skeletal(head: bytes) -> bool:
+    """From the first 0x60 bytes of a BFRES file: does it contain skeletal animations?"""
+    return head[:4] == b'FRES' and len(head) >= 0x60 and struct.unpack_from('<Q', head, 0x58)[0] != 0
 
 
 def parse_anims(raw: bytes) -> list[SkelAnim]:

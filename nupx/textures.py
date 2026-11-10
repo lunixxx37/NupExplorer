@@ -26,7 +26,7 @@ ASTC_BLOCKS = {0x2d: (4, 4), 0x2e: (5, 4), 0x2f: (5, 5), 0x30: (6, 5), 0x31: (6,
 FORMATS = {
     0x02: ('R8', 1, 1, 1), 0x07: ('R5G6B5', 1, 1, 2), 0x09: ('R8G8', 1, 1, 2), 0x0a: ('R16', 1, 1, 2),
     0x0b: ('R8G8B8A8', 1, 1, 4), 0x0c: ('B8G8R8A8', 1, 1, 4), 0x0e: ('R10G10B10A2', 1, 1, 4),
-    0x0f: ('R11G11B10', 1, 1, 4), 0x15: ('R16G16B16A16', 1, 1, 8),
+    0x0f: ('R11G11B10', 1, 1, 4), 0x12: ('R16G16', 1, 1, 4), 0x15: ('R16G16B16A16', 1, 1, 8),
     0x1a: ('BC1', 4, 4, 8), 0x1b: ('BC2', 4, 4, 16), 0x1c: ('BC3', 4, 4, 16), 0x1d: ('BC4', 4, 4, 8),
     0x1e: ('BC5', 4, 4, 16), 0x1f: ('BC6H', 4, 4, 16), 0x20: ('BC7', 4, 4, 16),
 }
@@ -218,6 +218,19 @@ def _decode_linear(lin: bytes, t: TexInfo, w: int, h: int, wb: int, hb: int) -> 
         else:  # integer data: stretch to full range for viewing
             mx = max(1.0, float(v.max()))
             out[..., 0] = _to8(v / mx)
+    elif ft == 0x12:  # two 16-bit channels, e.g. terrain height maps (Mario Kart World Map_GroundHeight_*)
+        if kind == 5:
+            v = a.view('<f2').reshape(h, w, 2).astype(np.float64)
+            lo, hi = float(np.nanmin(v)), float(np.nanmax(v))
+            if lo < 0.0 or hi > 1.0:  # data outside 0..1: normalise for viewing
+                v = (v - lo) / max(1e-9, hi - lo)
+        elif kind == 2:
+            v = a.view('<i2').reshape(h, w, 2).astype(np.float64) / 65534.0 + 0.5
+        else:
+            v = a.view('<u2').reshape(h, w, 2).astype(np.float64)
+            v = v / 65535.0 if kind == 1 else v / max(1.0, float(v.max()))
+        out[..., 0] = _to8(v[..., 0])
+        out[..., 1] = _to8(v[..., 1])
     elif ft == 0x07:
         v = a.view('<u2').reshape(h, w).astype(np.uint32)
         out[..., 0] = ((v >> 11) & 31) * 255 // 31
@@ -261,7 +274,8 @@ def _apply_comp_sel(rgba: np.ndarray, sel) -> np.ndarray:
     out = np.empty_like(rgba)
     for i, s in enumerate(sel):
         if s == 0:
-            out[..., i] = 0
+            # alpha forced to 0 (data textures such as R16G16 height maps): show the colour opaque
+            out[..., i] = 255 if i == 3 else 0
         elif s == 1:
             out[..., i] = 255
         elif 2 <= s <= 5:

@@ -23,7 +23,7 @@ import numpy as np  # noqa: E402
 
 from nupx import bfres  # noqa: E402
 from nupx.convert import eye_available, ramp_color  # noqa: E402
-from nupx.gltf import _shader_color  # noqa: E402
+from nupx.gltf import _GREY, _shader_color  # noqa: E402
 from nupx.vfs import VFS, classify  # noqa: E402
 
 
@@ -78,10 +78,14 @@ def main():
                         issues['eye_iris_missing_common_iris_used'].append((p, f'{mt.name}: {eye[0]}'))
                 elif 'eye_inner' in mt.name.lower() or 'eyeball' in mt.name.lower():
                     issues['eye_not_composited'].append((p, f'{mt.name}: {list(zip(mt.samplers, mt.textures))[:6]}'))
+                emm = mt.emissive()
                 if not eye and not (alb and v.find_texture(alb)) and not mt.shadow_only:
                     # what the viewer shows instead of a colour texture (same rules as gltf.build_glb)
                     ramp = ramp_color(v, mt)
                     col, blend = _shader_color(mt, mode, ramp)
+                    if emm and v.find_texture(emm) and col == _GREY:  # glows with its emission map
+                        col = [0.02, 0.02, 0.02, 1.0]
+                        stats['untextured_emission_map'] += 1
                     src = ('ramp' if ramp and col[:3] == ramp else 'shader_colour' if mt.palette_color()
                            and col[:3] == mt.palette_color() else 'default')
                     look = ('invisible' if col[3] == 0 else 'translucent' if blend else

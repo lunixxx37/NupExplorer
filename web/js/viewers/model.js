@@ -39,7 +39,7 @@ async function retryFailedTextures(gltf) {
     if (!obj || !obj.isMaterial || !ref || ref.materials === undefined) return;
     const def = json.materials?.[ref.materials] || {};
     const slots = [['map', def.pbrMetallicRoughness?.baseColorTexture, THREE.SRGBColorSpace],
-      ['normalMap', def.normalTexture, THREE.NoColorSpace]];
+      ['normalMap', def.normalTexture, THREE.NoColorSpace], ['emissiveMap', def.emissiveTexture, THREE.SRGBColorSpace]];
     for (const [key, info, colorSpace] of slots) {
       if (!info || obj[key]) continue;
       const uri = json.images?.[json.textures?.[info.index]?.source]?.uri;
@@ -61,11 +61,14 @@ function disposeObject(root) {
       for (const k of ['map', 'normalMap', 'aoMap', 'emissiveMap', 'roughnessMap', 'metalnessMap', 'alphaMap']) if (m[k]) m[k].dispose();
       if (m.userData.origMap) m.userData.origMap.dispose();
       if (m.userData.origNormal) m.userData.origNormal.dispose();
+      if (m.userData.origEmissive) m.userData.origEmissive.dispose();
       m.dispose();
     }
     if (o.skeleton) o.skeleton.dispose();
   });
 }
+
+const SECTION_LABELS = { material: 'material (texture/colour)', 'bone visibility': 'bone visibility', shape: 'shape', scene: 'scene (camera/light)' };
 
 export function show(root, meta, ctx = {}) {
   const isAnimFile = meta.type === 'anim';
@@ -227,8 +230,16 @@ export function show(root, meta, ctx = {}) {
       for (const m of Array.isArray(o.material) ? o.material : [o.material]) {
         if (m.userData.origMap === undefined) m.userData.origMap = m.map || null;
         if (m.userData.origNormal === undefined) m.userData.origNormal = m.normalMap || null;
+        if (m.userData.origEmissive === undefined && m.emissive) {
+          m.userData.origEmissive = m.emissiveMap || null;
+          m.userData.origEmissiveColor = m.emissive.clone();
+        }
         m.map = cbTex.checked ? m.userData.origMap : null;
         m.normalMap = cbNrm.checked ? m.userData.origNormal : null;
+        if (m.userData.origEmissive) {  // without textures an emission map would turn into a plain white glow
+          m.emissiveMap = cbTex.checked ? m.userData.origEmissive : null;
+          m.emissive.copy(cbTex.checked ? m.userData.origEmissiveColor : new THREE.Color(0, 0, 0));
+        }
         m.wireframe = cbWire.checked;
         m.needsUpdate = true;
       }
@@ -398,7 +409,15 @@ export function show(root, meta, ctx = {}) {
     const res = await getJSON('/api/anim/clips', { path: animPath });
     clipSel.replaceChildren(...res.clips.map((c) => el('option', { value: c.index, title: c.supported ? '' : 'Rotation mode not supported' },
       `${c.name}  (${c.frames} F${c.loop ? ', Loop' : ''})${c.supported ? '' : ' ⚠'}`)));
-    animMsg.textContent = `${res.clips.length} animations in ${baseName(animPath)}`;
+    if (res.clips.length) {
+      animMsg.textContent = `${res.clips.length} animations in ${baseName(animPath)}`;
+    } else {
+      // e.g. material-only files (texture scrolling, colour changes) – nothing the viewer can play
+      const other = Object.entries(res.sections || {}).filter(([k]) => k !== 'skeletal')
+        .map(([k, n]) => `${n} ${SECTION_LABELS[k] || k}`);
+      animMsg.replaceChildren(el('div', { class: 'warn' }, `No skeletal animations in ${baseName(animPath)}.`
+        + (other.length ? ` It only contains ${other.join(', ')} animations, which the viewer does not play.` : '')));
+    }
     updateExportButtons();
   }
 
@@ -490,7 +509,7 @@ export function show(root, meta, ctx = {}) {
     updateExportButtons();
   }
   function updateExportButtons() {
-    expAllBtn.disabled = !(modelRoot && animPath);
+    expAllBtn.disabled = !(modelRoot && animPath && clipSel.options.length);
     expClipBtn.disabled = !(modelRoot && animPath && clipSel.value !== '');
   }
   expClipBtn.addEventListener('click', () => exportGlb(false));

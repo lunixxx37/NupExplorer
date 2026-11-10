@@ -31,7 +31,7 @@ mimetypes.add_type('application/javascript', '.mjs')
 mimetypes.add_type('text/css', '.css')
 mimetypes.add_type('image/svg+xml', '.svg')
 
-VERSION = '1.0.1'
+VERSION = '1.1.0'
 
 
 class State:
@@ -134,11 +134,14 @@ class State:
     def get_vis_anims(self, path: str):
         return self._get_anim_data(path)[1]
 
+    def get_anim_sections(self, path: str) -> dict:
+        return self._get_anim_data(path)[2]
+
     def _get_anim_data(self, path: str):
         a = self.anims.get(path)
         if a is None:
             raw = self.vfs.read(path)
-            a = (A.parse_anims(raw), A.parse_vis_anims(raw))
+            a = (A.parse_anims(raw), A.parse_vis_anims(raw), A.sections(raw))
             self.anims.put(path, a, len(raw))
         return a
 
@@ -154,21 +157,47 @@ class State:
         return f'api/texture.png?{q}'
 
 
+MALS = 'romfs/Mals/'
+
+
+def _mals_lang(arc: str) -> tuple[str | None, object]:
+    """Language of a text archive and a function that builds the same archive for another language.
+
+    romfs/Mals/USen.Product.110.sarc.zs   one archive per language (Ocarina of Time)
+    romfs/Mals/USen/MsgMain.msarc         one folder per language (Mario Kart World)
+    """
+    if not arc.startswith(MALS):
+        return None, None
+    rel = arc[len(MALS):]
+    if '/' in rel:
+        lang, _, rest = rel.partition('/')
+        return lang, lambda other: f'{MALS}{other}/{rest}'
+    lang, _, rest = rel.partition('.')
+    return lang, lambda other: f'{MALS}{other}.{rest}'
+
+
+def _bone_names(models) -> set[str]:
+    return {b.name for m in models if m.skeleton is not None for b in m.skeleton.bones}
+
+
 def _languages(vfs: VFS) -> list[str]:
     langs = set()
-    for f in vfs.c.dirs.get('romfs/Mals', ([], []))[1]:
-        if f.endswith('.sarc.zs'):
+    subdirs, files = vfs.c.dirs.get(MALS.rstrip('/'), ([], []))
+    for f in files:
+        if classify(f) == 'archive':
             langs.add(f.split('.', 1)[0])
+    for d in subdirs:
+        if any(classify(f) == 'archive' for f in vfs.c.dirs.get(MALS + d, ([], []))[1]):
+            langs.add(d)
     return sorted(langs)
 
 
 def _msbt_lang_path(path: str, lang: str, vfs: VFS) -> str | None:
     arc, sep, inner = path.partition('::')
-    if not sep or not arc.startswith('romfs/Mals/'):
+    _cur, build = _mals_lang(arc)
+    if not sep or build is None:
         return None
-    fname = arc.rpartition('/')[2]
-    rest = fname.split('.', 1)[1]
-    cand = f'romfs/Mals/{lang}.{rest}'
+    cand = build(lang)
     if cand in vfs.c.files:
         return f'{cand}::{inner}'
     return None
@@ -314,14 +343,14 @@ def create_app(state: State) -> Flask:
             elif t == 'model':
                 models = state.get_models(path)
                 m['model'] = bfres.model_summary(models)
-                m['anim_suggestions'] = v.anim_candidates(path)
+                m['anim_suggestions'] = v.anim_candidates(path, bones=_bone_names(models))
             elif t == 'anim':
                 m['clips'] = A.clip_list(state.get_anims(path))
+                m['sections'] = state.get_anim_sections(path)
                 m['model_suggestions'] = v.model_candidates(path)
             elif t == 'msbt':
                 m['languages'] = _languages(v)
-                arc = path.partition('::')[0]
-                m['lang'] = arc.rpartition('/')[2].split('.', 1)[0] if arc.startswith('romfs/Mals/') else None
+                m['lang'] = _mals_lang(path.partition('::')[0])[0]
             elif t == 'byml':
                 d = v.read(path)
                 m['byml_version'] = int.from_bytes(d[2:4], 'little' if d[:2] == b'YB' else 'big')
@@ -404,7 +433,9 @@ def create_app(state: State) -> Flask:
 
     @app.get('/api/anim/clips')
     def api_anim_clips():
-        return jsonify({'path': arg('path'), 'clips': A.clip_list(state.get_anims(arg('path')))})
+        path = arg('path')
+        return jsonify({'path': path, 'clips': A.clip_list(state.get_anims(path)),
+                        'sections': state.get_anim_sections(path)})
 
     @app.get('/api/anim/clip.bin')
     def api_anim_clip():
@@ -430,7 +461,15 @@ def create_app(state: State) -> Flask:
     @app.get('/api/anim/suggest')
     def api_anim_suggest():
         v = state.vfs
-        return jsonify({'suggested': v.anim_candidates(arg('model')), 'all': v.all_anims()})
+        model = arg('model')
+        suggested = []
+        if model:
+            try:
+                bones = _bone_names(state.get_models(model))
+            except Exception:  # noqa: BLE001 - unreadable model: suggest by name only
+                bones = None
+            suggested = v.anim_candidates(model, bones=bones)
+        return jsonify({'suggested': suggested, 'all': v.all_anims()})
 
     # ---------------------------------------------------------------- text & data
     @app.get('/api/msbt')

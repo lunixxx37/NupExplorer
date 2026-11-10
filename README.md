@@ -15,12 +15,14 @@ textures, music and voice, 3D models with skeletal animations, texts and game da
   virtualized (folders with 20,000+ entries stay smooth), search (all words must match) and type filter.
   SARC/pack archives expand like folders.
 - **Textures** (BNTX with the Switch 2 block-linear swizzle): BC1–BC7, BC6H, ASTC 4×4 … 12×12, R8G8, R16,
-  R11G11B10F, RGBA16F. Zoom/pan, single channels, mip levels, array layers and cube faces.
+  R16G16, R11G11B10F, RGBA16F. Zoom/pan, single channels, mip levels, array layers and cube faces.
 - **Audio** (BWAV): DSP-ADPCM and Opus, waveform, seeking, loop points from the file, up to 6 channels
   (the preview is mixed down to stereo, the export keeps all channels).
 - **3D models** (BFRES v10): meshes and LOD levels, textures and normal maps, skeleton, **skeletal
   animations** including mesh visibility tracks, and the game's **compressed meshlet geometry** used by most
-  map parts. Material colours are approximated from the shader parameters (gems, glass, liquids, hair, eyes).
+  map parts. Material colours are approximated from the shader parameters (gems, glass, liquids, hair, eyes);
+  emission maps make lights and glowing parts glow. Animation files are matched to their models by name
+  (including shared character animations for costume models); files with only material animations are marked.
 - **Texts** (MSBT) as a table with a second language side by side, download as JSON/CSV.
 - **Game data** (BYML/GYML) as YAML with search, download as YAML/JSON.
 - **Export** – single files, folders or archives:
@@ -110,14 +112,19 @@ python tests\curve_check.py path\to\file.nup  # animation curve decoder acceptan
 Everything below was reverse engineered from the data; details are in the module docstrings.
 
 - **NUP container** (`nupx/container.py`): header `NUP\x01`, TOC with sections (base game, update),
-  directory and file tables, string pool, SHA-256 per file. Files are stored unencrypted.
+  directory and file tables, string pool, SHA-256 per file. Files are stored unencrypted; newer NUP files
+  store some files as a single zstd frame (file record: compression 1, stored size, original size).
 - **Zstd**: dictionary chosen by the ID in the frame header (1 `zs`, 2 `bkprb`, 3 `bcett.byml`, 4 `pack`,
   taken from `romfs/Pack/ZsDic.pack.zs`).
 - **BNTX** (`nupx/textures.py`): platform block `Ounc`; Switch 2 GOB bit order `x0..x3, y0, y1, x4, y2, x5`.
 - **BWAV** (`nupx/audio.py`): DSP-ADPCM, or Nintendo Opus packets re-muxed into Ogg.
-- **BFRES v10.4** (`nupx/bfres.py`, `nupx/anim.py`): skeletal animation curves are cubic Hermite curves with
-  (value, slope) per key, quantized (flag 0x0800) or float; quaternion curves (flag 0x80) use slerp; Euler
-  rotations compose as R = Rz·Ry·Rx and the rotation type is chosen **per bone** (flag 0x00100000).
+- **BFRES v10.2 / v10.4** (`nupx/bfres.py`, `nupx/anim.py`): skeletal animation curves are cubic Hermite curves
+  with (value, slope) per key, quantized (8/16-bit keys after a slope header; v10.4 also sets flag 0x0800) or
+  float; 8/16-bit frame numbers are multiplied by the curve's frame scale when flag 0x0400 is set; quaternion
+  curves (flag 0x80) use slerp; Euler rotations compose as R = Rz·Ry·Rx and the rotation type is chosen
+  **per bone** (flag 0x00100000).
+- **Texts**: one SARC per language (`romfs/Mals/<Lang>.Product.<ver>.sarc.zs`) or one folder per language
+  (`romfs/Mals/<Lang>/*.msarc`); the language compare looks up the same MSBT in the other language.
 - **Materials**: render-info and shader-parameter names are only stored as 64-bit hashes. Identified by
   comparing all materials: render info `c449e543484e03dc` = "shadow only", `9637173a98b4d882` = blend mode,
   colour parameters `ad91cd2b…`, `d8c1e846…`, `6e1f54c6…` carry the surface colour of untextured materials.
@@ -133,6 +140,8 @@ Everything below was reverse engineered from the data; details are in the module
 - Materials are approximated with a base colour and a normal map. Effects that only exist in the game's
   shaders (e.g. the dark look of shadow characters, terrain blending) are not reproduced.
 - A few materials reference textures that do not exist in the game files; they show a shader colour or grey.
+  Untextured materials whose colour parameters are not known yet are shown grey as well.
+- Material animations (texture scrolling, colour changes) are recognised but not played.
 - Terrain (`TerrainArc`), effects and physics data are only available as hex view / raw export.
 
 ## Legal

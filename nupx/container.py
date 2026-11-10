@@ -6,7 +6,11 @@ Layout (little endian), reverse engineered:
          u64 strpool_offset (relative to TOC), u64 strpool_length, u64 pad      (0x30 bytes)
          section descriptors, 0x40 each: u64 title_id, u32 root_dir, u32 exefs_dir, u32 romfs_dir, ...
   dirs   24 B each: u32 name_off, u32 name_len, u32 child_start, u32 child_count, u64 reserved
-  files  80 B each: u32 name_off, u32 name_len, u64 size, u64 offset, u64 size2, u8 sha256[32], u64[2] reserved
+  files  80 B each: u32 name_off, u32 name_len, u64 size, u64 offset, u64 stored_size, u8 sha256[32],
+         u64 compression, u64 reserved
+         compression 0: stored as is (stored_size == size)
+         compression 1: stored as one zstd frame of stored_size bytes that unpacks to size bytes
+                        (newer NUP files, e.g. Mario Kart World; OT.nup does not use it)
   child  u32 list; value < dir_count -> directory, else file (value - dir_count)
   string pool
 
@@ -25,12 +29,23 @@ import time
 
 import numpy as np
 
+try:  # Python 3.14+
+    from compression.zstd import ZstdDecompressor as _ZstdDecompressor
+    from compression.zstd import decompress as _zstd_unpack
+except ImportError:  # fallback: zstandard package
+    import zstandard as _zs
+
+    _ZstdDecompressor = None
+
+    def _zstd_unpack(data: bytes) -> bytes:
+        return _zs.ZstdDecompressor().decompressobj().decompress(data)
+
 INDEX_VERSION = 2
 
 _DIR_DT = np.dtype([('name_off', '<u4'), ('name_len', '<u4'), ('child_start', '<u4'),
                     ('child_count', '<u4'), ('reserved', '<u8')])
 _FILE_DT = np.dtype([('name_off', '<u4'), ('name_len', '<u4'), ('size', '<u8'), ('offset', '<u8'),
-                     ('size2', '<u8'), ('sha', 'V32'), ('r1', '<u8'), ('r2', '<u8')])
+                     ('stored_size', '<u8'), ('sha', 'V32'), ('compression', '<u8'), ('reserved', '<u8')])
 assert _DIR_DT.itemsize == 24 and _FILE_DT.itemsize == 80
 
 
@@ -156,11 +171,36 @@ class NupContainer:
 
     # ------------------------------------------------------------------ access
     def read(self, vpath: str) -> bytes:
-        off, size, _fi, _li = self.files[vpath]
-        return self._mm[off:off + size]
+        off, size, fi, _li = self.files[vpath]
+        rec = self.file_off + fi * 80
+        comp = struct.unpack_from('<Q', self._mm, rec + 0x40)[0]
+        if comp == 0:
+            return self._mm[off:off + size]
+        if comp != 1:
+            raise ValueError(f'NUP: unknown compression {comp} for {vpath}')
+        stored = struct.unpack_from('<Q', self._mm, rec + 0x18)[0]
+        data = _zstd_unpack(self._mm[off:off + stored])
+        if len(data) != size:
+            raise ValueError(f'NUP: {vpath} unpacked to {len(data)} bytes instead of {size}')
+        return data
 
-    def read_range(self, off: int, size: int) -> bytes:
-        return self._mm[off:off + size]
+    def read_head(self, vpath: str, n: int) -> bytes:
+        """The first n bytes (or the whole file if it is smaller) without reading everything."""
+        off, size, fi, _li = self.files[vpath]
+        rec = self.file_off + fi * 80
+        if struct.unpack_from('<Q', self._mm, rec + 0x40)[0] == 0:
+            return self._mm[off:off + min(size, n)]
+        stored = struct.unpack_from('<Q', self._mm, rec + 0x18)[0]
+        # a zstd block holds at most 128 KiB, so that much input always yields the first n bytes
+        part = self._mm[off:off + min(stored, n + 0x20100)]
+        if _ZstdDecompressor is None:
+            return _zstd_unpack(self._mm[off:off + stored])[:n]
+        return _ZstdDecompressor().decompress(part, max_length=n)
+
+    def is_packed(self, vpath: str) -> bool:
+        """True if the container stores this file zstd-compressed (record compression 1)."""
+        fi = self.files[vpath][2]
+        return struct.unpack_from('<Q', self._mm, self.file_off + fi * 80 + 0x40)[0] != 0
 
     def sha256(self, vpath: str) -> str:
         fi = self.files[vpath][2]

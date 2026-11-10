@@ -302,6 +302,14 @@ class Material:
     def normal(self):
         return self.texture_for('_n0', ('_Nrm', '_nrm'))
 
+    def emissive(self):
+        """Emission map (*_Emm on the _e0 / _em0 slot): lights, screens, boost rings. Other emission
+        slots (_ec0 *_Emc, _elfil0 *_ElFil) are masks the shader combines with colours."""
+        for s, t in zip(self.samplers, self.textures):
+            if s in ('_e0', '_em0') and t.rpartition('_')[2].startswith('Emm'):
+                return t
+        return None
+
 
 def _shader_values(raw: bytes, fmat: int, render: list[str]):
     """({render-info name hash: string value}, [colour params]) of one material; empty on odd layouts."""

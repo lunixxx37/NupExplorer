@@ -1,13 +1,15 @@
 """Smoke test: decode random samples of every asset type and check plausibility.
 
-  python tests/smoke.py [path/to/OT.nup] [samples per type]
+  python tests/smoke.py [path/to/file.nup] [samples per type]
 Checks
   textures  decode without error; smoothness (garbled swizzle = noise); mip 2 ~ downscaled mip 0
   audio     decode; sample count matches header; zero-crossing rate far from white noise
   models    inverse bind matrices reproduce (R = Rz*Ry*Rx); indices inside their vertex slice;
             blend indices map to the shape's skin bone list; GLB structurally valid
   anims     clips bake without NaN
+  packed    files the container stores zstd-compressed unpack to their size
   msbt/byml parse without exceptions
+  regressions for Ocarina of Time and Mario Kart World run when their files exist
 """
 import collections
 import json
@@ -89,7 +91,7 @@ def main():
         raw = v.read(p)
         for t in textures.parse_bntx(raw)[:2]:
             img = textures.decode(raw, t, 0, 0)
-            if t.ftype not in (0x0a, 0x15, 0x0f):  # data/HDR textures are not "images"
+            if t.ftype not in (0x0a, 0x12, 0x15, 0x0f) and min(img.shape[:2]) > 1:  # data/HDR textures, 1-px LUTs
                 tex_tv.append(tv(img))
             if t.mips > 2 and min(t.width, t.height) >= 64:
                 m2 = textures.decode(raw, t, 2, 0)
@@ -220,6 +222,27 @@ def main():
                 d = angle(data[i, 0, 3:7].astype(float), bq[b['name']])
                 assert d < 20, f'{clip}: {b["name"]} {d:.1f} deg from bind'
 
+    def t_packed(p):
+        """Regression: files the container stores zstd-compressed (record compression 1, e.g. Mario Kart World)."""
+        data = v.c.read(p)
+        assert len(data) == v.c.files[p][1], 'unpacked size'
+        assert v.c.read_head(p, 64) == data[:64], 'read_head'
+
+    def t_matching(spec):
+        """Regression: animation <-> model matching by name (Mario Kart World DriverA_* / costumes)."""
+        anim_path, model_path, costume_path, base_anim = spec
+        assert v.model_candidates(anim_path)[:1] == [model_path], v.model_candidates(anim_path)[:3]
+        bones = {b.name for m in bfres.parse_models(v.read(costume_path)) for b in m.skeleton.bones}
+        assert base_anim in v.anim_candidates(costume_path, bones=bones), 'base character animations for a costume'
+        assert not v.has_skeletal('romfs/Model/Driver_YoshiHachimaki.anim.bfres.zs'), 'material-only file'
+
+    def t_r16g16(p):
+        """Regression: R16G16 UNORM height maps (format 0x12), alpha forced to 0 by the channel mapping."""
+        raw = v.read(p)
+        t = textures.parse_bntx(raw)[0]
+        img = textures.decode(raw, t, 0, 0)
+        assert t.ftype == 0x12 and img[..., 3].min() == 255 and img[..., 0].std() > 5, 'height map'
+
     def t_byml(p):
         obj = byml.parse(v.read(p))
         byml.to_yaml(obj)
@@ -256,8 +279,16 @@ def main():
     run('shader', [s for s in shader_specs if s[0] in v.c.files], t_shader_materials)
     cp = 'romfs/Model/Obj_FireTemple_FirePillar_A.Obj_FireTemple_FirePillar_A_01.bfres.zs'
     run('cluster', [cp] if cp in v.c.files else [], t_cluster)
+    packed = [p for p in v.c.files if v.c.is_packed(p)]
+    run('packed', random.sample(packed, min(n, len(packed))), t_packed)
+    mk = 'romfs/Model/'
+    match_spec = (mk + 'DriverA_YoshiHachimaki_Kart.anim.bfres.zs', mk + 'Driver_YoshiHachimaki.Driver_YoshiHachimaki.bfres.zs',
+                  mk + 'Driver_YoshiCasual.Driver_YoshiCasual.bfres.zs', mk + 'DriverA_Yoshi_Kart.anim.bfres.zs')
+    run('matching', [match_spec] if all(x in v.c.files for x in match_spec) else [], t_matching)
+    hp = 'romfs/Tex/Map_GroundHeight_0_0_GroundHeight.bntx.zs'
+    run('r16g16', [hp] if hp in v.c.files else [], t_r16g16)
     run('byml', random.sample(by_type['byml'], n), t_byml)
-    run('msbt', random.sample(msbt_files, n), t_msbt)
+    run('msbt', random.sample(msbt_files, min(n, len(msbt_files))), t_msbt)
 
     pc = lambda a, q: f'{np.percentile(a, q):.3g}' if len(a) else '-'  # noqa: E731
     print('Results (ok/total, time):')

@@ -65,6 +65,7 @@ class GlbBuilder:
 _GLASSY = ('glass', 'liquid', 'water', 'bubble', 'drop', 'drool', 'membrane', 'potion', 'bottle', 'crystal',
            'structuralcolor')
 _WATER = [0.16, 0.32, 0.42]
+_GREY = [0.62, 0.62, 0.62, 1.0]  # no colour information at all
 _SHADOW = re.compile(r'shadow(?!temple)')  # blob/fake shadows, not the Shadow Temple
 
 
@@ -84,7 +85,7 @@ def _shader_color(mat: B.Material, mode: str | None, ramp: list[float] | None):
     if any(k in name for k in _GLASSY) or (mode == 'MASK' and mat.blends):
         return (pal or [0.85, 0.9, 0.9]) + [0.3], True  # glass, liquids, alpha-blended shader effects
     col = ramp or pal
-    return (col or [0.62, 0.62, 0.62]) + [1.0], False
+    return (col + [1.0]) if col else list(_GREY), False
 
 
 def build_glb(models: list[B.Model], lod: int = 0, texture_uri=None, texture_png=None,
@@ -166,6 +167,11 @@ def build_glb(models: list[B.Model], lod: int = 0, texture_uri=None, texture_png
                       'pbrMetallicRoughness': {'metallicFactor': 0.0, 'roughnessFactor': 0.85}}
                 alb = mat.albedo()
                 eye = mat.eye_layers()
+                emm = mat.emissive()
+                ei = texture(emm, 'color')[0] if emm else None
+                if ei is not None:
+                    gm['emissiveTexture'] = {'index': ei}
+                    gm['emissiveFactor'] = [1.0, 1.0, 1.0]
                 ti = None
                 if eye:  # iris + sclera blended through the iris mask (what the eye shader does)
                     ti, alpha = texture('|'.join(eye), 'eye')
@@ -181,8 +187,10 @@ def build_glb(models: list[B.Model], lod: int = 0, texture_uri=None, texture_png
                     elif mode == 'BLEND':
                         gm['alphaMode'] = 'BLEND'
                 else:
-                    gm['pbrMetallicRoughness']['baseColorFactor'], blend = _shader_color(
-                        mat, mode, fallback_color(mat) if fallback_color is not None else None)
+                    col, blend = _shader_color(mat, mode, fallback_color(mat) if fallback_color is not None else None)
+                    if ei is not None and col == _GREY:  # only an emission map (boost rings, lamps): it is the colour
+                        col = [0.02, 0.02, 0.02, 1.0]
+                    gm['pbrMetallicRoughness']['baseColorFactor'] = col
                     if blend:
                         gm['alphaMode'] = 'BLEND'
                 nrm = mat.normal()
@@ -191,7 +199,7 @@ def build_glb(models: list[B.Model], lod: int = 0, texture_uri=None, texture_png
                     if ti is not None:
                         gm['normalTexture'] = {'index': ti}
                 gm['extras'] = {'textures': mat.textures, 'samplers': mat.samplers, 'albedo': alb, 'normal': nrm,
-                                'render_mode': mode, 'shadow_only': mat.shadow_only}
+                                'emissive': emm, 'render_mode': mode, 'shadow_only': mat.shadow_only}
                 g['materials'].append(gm)
                 mat_index[s.material] = len(g['materials']) - 1
             attrs = {'POSITION': gb.accessor(geo.positions, FLOAT, 'VEC3', ARRAY_BUFFER, minmax=True)}

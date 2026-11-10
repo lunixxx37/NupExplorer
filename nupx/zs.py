@@ -21,6 +21,10 @@ try:  # Python 3.14+
     def _decompress(data: bytes, d=None) -> bytes:
         return _z.decompress(data, zstd_dict=d) if d is not None else _z.decompress(data)
 
+    def _decompress_head(data: bytes, n: int, d=None) -> bytes:
+        dec = _z.ZstdDecompressor(zstd_dict=d) if d is not None else _z.ZstdDecompressor()
+        return dec.decompress(data, max_length=n)
+
     ZstdError = _z.ZstdError
 except ImportError:  # fallback: zstandard package
     import zstandard as _zs
@@ -35,6 +39,9 @@ except ImportError:  # fallback: zstandard package
     def _decompress(data: bytes, d=None) -> bytes:
         dctx = _zs.ZstdDecompressor(dict_data=d) if d is not None else _zs.ZstdDecompressor()
         return dctx.decompressobj().decompress(data)
+
+    def _decompress_head(data: bytes, n: int, d=None) -> bytes:
+        return _decompress(data, d)[:n]
 
     ZstdError = _zs.ZstdError
 
@@ -56,7 +63,9 @@ class ZstdCodec:
         if name == 'zs.zsdic':
             self.default_id = did
 
-    def decompress(self, data: bytes) -> bytes:
+    def decompress(self, data: bytes, head: int | None = None) -> bytes:
+        """Whole frame, or with head=n only the first n bytes (data may then be truncated)."""
+        run = _decompress if head is None else (lambda b, d=None: _decompress_head(b, head, d))
         try:
             did = _frame_dict_id(data)
         except Exception:
@@ -65,10 +74,10 @@ class ZstdCodec:
             d = self.dicts.get(did)
             if d is None:
                 raise ValueError(f'Unknown zstd dictionary {did}')
-            return _decompress(data, d)
+            return run(data, d)
         if self.default_id is not None:
             try:
-                return _decompress(data, self.dicts[self.default_id])
+                return run(data, self.dicts[self.default_id])
             except ZstdError:
                 pass
-        return _decompress(data)
+        return run(data)

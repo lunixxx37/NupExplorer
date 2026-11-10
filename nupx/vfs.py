@@ -13,6 +13,8 @@ import re
 import threading
 import zlib
 
+from .anim import has_skeletal as has_skeletal_anims
+from .anim import skeletal_bone_names
 from .container import NupContainer
 from .sarc import Sarc
 from .util import ByteLRU
@@ -22,7 +24,7 @@ TYPE_LABELS = {
     'texture': 'Texture', 'audio': 'Audio', 'model': '3D model', 'anim': 'Animation',
     'msbt': 'Text (MSBT)', 'byml': 'Data (BYML)', 'archive': 'Archive', 'other': 'File',
 }
-ARCHIVE_EXTS = ('.pack', '.sarc', '.blarc', '.bfarc')
+ARCHIVE_EXTS = ('.pack', '.sarc', '.blarc', '.bfarc', '.msarc')
 
 
 def classify(name: str) -> str:
@@ -39,7 +41,7 @@ def classify(name: str) -> str:
         return 'model'
     if n.endswith('.msbt'):
         return 'msbt'
-    if n.endswith(('.byml', '.bgyml')):
+    if n.endswith(('.byml', '.bgyml', '.byaml')):
         return 'byml'
     if n.endswith(ARCHIVE_EXTS):
         return 'archive'
@@ -48,6 +50,19 @@ def classify(name: str) -> str:
 
 def _sort_key(s: str):
     return s.lower()
+
+
+def _variant_stem(stem: str) -> str:
+    """DriverA_Yoshi_Kart -> Driver_Yoshi_Kart. A capital letter appended to a word names a set of
+    animations for the models of that word (Mario Kart World: DriverA_* animates Driver_* models)."""
+    return '_'.join(t[:-1] if re.fullmatch(r'[A-Z][a-z]{2,}[A-Z]', t) else t for t in stem.split('_'))
+
+
+def _camel_parents(tok: str) -> list[str]:
+    """YoshiHachimaki -> ['Yoshi'], BabyMarioSwim -> ['BabyMario', 'Baby'], DKOffroad -> ['DK']."""
+    parts = re.split(r'(?<=[a-z0-9])(?=[A-Z])|(?<=[A-Z])(?=[A-Z][a-z])', tok)
+    out = [''.join(parts[:i]) for i in range(len(parts) - 1, 0, -1)]
+    return [p for p in out if len(p) >= 2]
 
 
 class Archive:
@@ -83,6 +98,10 @@ class VFS:
         self._search_cache = None
         self._tex_index = None
         self._tex_alias: dict[str, str | None] = {}
+        self._skel_cache: dict[str, bool] = {}
+        self._bone_cache: dict[str, frozenset] = {}
+        self._anims: list[str] | None = None
+        self._models: list[str] | None = None
         self._lock = threading.Lock()
 
     # ------------------------------------------------------------------ reading
@@ -243,62 +262,141 @@ class VFS:
             self._tex_alias[key] = hits[0] if len(hits) == 1 else None
         return self._tex_alias[key]
 
-    def anim_candidates(self, model_path: str, limit: int = 60) -> list[str]:
-        """Animation files that probably belong to a model (name heuristics)."""
+    def head(self, path: str, n: int) -> bytes:
+        """The first n bytes after removing the zstd layer, without unpacking the whole file."""
+        data = self.read_stored(path) if '::' in path else self.c.read_head(path, n + 0x20100)
+        return self.zstd.decompress(data, head=n) if is_zstd(data) else data[:n]
+
+    def has_skeletal(self, path: str) -> bool:
+        """Does an animation file contain skeletal animations (not only material ones)? Cached."""
+        hit = self._skel_cache.get(path)
+        if hit is None:
+            try:
+                hit = has_skeletal_anims(self.head(path, 0x60))
+            except Exception:  # noqa: BLE001 - unreadable: keep it in the lists
+                hit = True
+            self._skel_cache[path] = hit
+        return hit
+
+    def anim_bones(self, path: str) -> frozenset:
+        """Bone names animated by an animation file. Cached."""
+        hit = self._bone_cache.get(path)
+        if hit is None:
+            try:
+                hit = frozenset(skeletal_bone_names(self.read(path)))
+            except Exception:  # noqa: BLE001
+                hit = frozenset()
+            self._bone_cache[path] = hit
+        return hit
+
+    def anim_candidates(self, model_path: str, limit: int = 60, bones: set | None = None) -> list[str]:
+        """Animation files with skeletal animations that probably belong to a model (name heuristics).
+
+        Ranked: animations named after the model (Animal_Cow -> Animal_Cow_Animation, Driver_YoshiIce ->
+        DriverA_YoshiIce_Kart), then those of the base character (Driver_YoshiIce -> DriverA_Yoshi_Kart).
+        The latter are only kept if they animate at least half of the model's bones (bones = its skeleton).
+        """
         base = model_path.rpartition('::')[2].rpartition('/')[2]
         stem = re.sub(r'\.(bfres)(\.zs)?$', '', base, flags=re.I)
-        parts = stem.split('.')
-        keys = [k for k in dict.fromkeys(parts) if k]
-        roots = set()
+        keys = [k for k in dict.fromkeys(stem.split('.')) if k]
+        roots: dict[str, int] = {}  # root -> tier (0 = model name, 1 = camel-case parent)
         for k in keys:
-            roots.add(k)
             toks = k.split('_')
-            for n in range(len(toks), 1, -1):
-                roots.add('_'.join(toks[:n]))
-        anims = [p for p in self.c.files if p.lower().endswith('.anim.bfres.zs') or p.lower().endswith('.anim.bfres')]
+            for r in [k] + ['_'.join(toks[:n]) for n in range(len(toks), 1, -1)]:
+                roots[r] = 0
+        for r in list(roots):
+            pre, _, last = r.rpartition('_')
+            for parent in _camel_parents(last) if pre else ():  # never a bare word like 'Enemy'
+                roots.setdefault(f'{pre}_{parent}', 1)
         scored = []
-        for p in anims:
+        for p in self.all_anims():
             n = p.rpartition('/')[2]
-            stem_a = n.split('.anim.')[0]
-            best = 0
-            for r in roots:
-                if stem_a == r or stem_a == r + '_Animation':
-                    best = max(best, 1000 + len(r))
-                elif stem_a.startswith(r + '_') or stem_a.startswith(r + '.'):
-                    best = max(best, 100 + len(r))
-            if best:
-                scored.append((-best, n.lower(), p))
+            sa = n.split('.anim.')[0]
+            best = None
+            for s in {sa, _variant_stem(sa)}:
+                for r, tier in roots.items():
+                    if s == r or s == r + '_Animation':
+                        key = (tier, 0, -len(r))
+                    elif s.startswith(r + '_') or s.startswith(r + '.'):
+                        key = (tier, 1, -len(r))
+                    else:
+                        continue
+                    if best is None or key < best:
+                        best = key
+            if best is not None:
+                scored.append((best, n.lower(), p))
         scored.sort()
-        return [p for _, _, p in scored[:limit]]
+        out = []
+        for (tier, *_), _n, p in scored:
+            if not self.has_skeletal(p):
+                continue
+            if tier:  # weaker match by the base character's name: the skeleton has to fit
+                hit = len(self.anim_bones(p) & bones) if bones else 0
+                if hit < 2 or hit < 0.5 * len(bones):
+                    continue
+            out.append(p)
+            if len(out) >= limit:
+                break
+        return out
 
     def model_candidates(self, anim_path: str, limit: int = 40) -> list[str]:
-        """Models that probably fit an animation file (name heuristics)."""
+        """Models that probably fit an animation file (name heuristics).
+
+        Ranked: the model named in the animation (Dm_Graveyard_0010_Player_Child -> Player_Child,
+        DriverA_Yoshi_Kart -> Driver_Yoshi), then its costumes (Driver_YoshiIce), then the base character
+        of a costume animation (DriverA_YoshiIce_Kart -> Driver_Yoshi).
+        """
         base = anim_path.rpartition('::')[2].rpartition('/')[2]
         stem = base.split('.anim.')[0]
         stem = re.sub(r'_Animation$', '', stem)
-        toks = stem.split('_')
-        # every contiguous run of name parts (longest first), e.g. Dm_Graveyard_0010_Player_Child -> Player_Child
-        roots = []
-        for n in range(len(toks), 0, -1):
-            for i in range(0, len(toks) - n + 1):
-                r = '_'.join(toks[i:i + n])
-                if (n >= 2 or len(toks) == 1) and not r[0].isdigit() and r not in roots:
-                    roots.append(r)
-        models = [p for p in self.c.files if p.startswith('romfs/Model/') and classify(p) == 'model'
-                  and '.Skeleton.' not in p]
+        roots: list[tuple[str, int]] = []  # (root, tier) in order of preference
+        seen = set()
+
+        def add(r, tier):
+            if r and not r[0].isdigit() and r not in seen:
+                seen.add(r)
+                roots.append((r, tier))
+
+        for s in dict.fromkeys((stem, _variant_stem(stem))):
+            toks = s.split('_')
+            # every contiguous run of name parts (longest first), e.g. Dm_Graveyard_0010_Player_Child -> Player_Child
+            for n in range(len(toks), 0, -1):
+                for i in range(0, len(toks) - n + 1):
+                    if n >= 2 or len(toks) == 1:
+                        add('_'.join(toks[i:i + n]), 0)
+        for r, _tier in list(roots):
+            pre, _, last = r.rpartition('_')
+            for parent in _camel_parents(last) if pre else ():  # never a bare word like 'Enemy'
+                add(f'{pre}_{parent}', 1)
         scored = []
-        for p in models:
+        for p in self._model_paths():
             n = p.rpartition('/')[2]
             group = n.split('.')[0]
-            for rank, r in enumerate(roots):
+            best = None
+            for rank, (r, tier) in enumerate(roots):
                 if group == r or group.startswith(r + '_'):
-                    scored.append((rank, group != r, n.lower(), p))
-                    break
+                    key = (tier, 0, rank, group != r)
+                elif group.startswith(r) and group[len(r):len(r) + 1].isupper():  # costume: Driver_Yoshi -> Driver_YoshiIce
+                    key = (tier, 1, rank, True)
+                else:
+                    continue
+                if best is None or key < best:
+                    best = key
+            if best is not None:
+                scored.append((best, n.lower(), p))
         scored.sort()
         return [p for *_, p in scored[:limit]]
 
     def all_anims(self) -> list[str]:
-        return sorted((p for p in self.c.files if classify(p) == 'anim'), key=str.lower)
+        if self._anims is None:
+            self._anims = sorted((p for p in self.c.files if classify(p) == 'anim'), key=str.lower)
+        return self._anims
+
+    def _model_paths(self) -> list[str]:
+        if self._models is None:
+            self._models = [p for p in self.c.files if p.startswith('romfs/Model/') and classify(p) == 'model'
+                            and '.Skeleton.' not in p]
+        return self._models
 
     def close(self):
         self.c.close()
