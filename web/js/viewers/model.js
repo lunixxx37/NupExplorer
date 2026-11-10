@@ -513,6 +513,7 @@ export function show(root, meta, ctx = {}) {
     playing = false; action.paused = true; playBtn.replaceChildren(icon('play'));
     action.time = Number(slider.value);
     mixer.update(0);
+    tLabel.textContent = `${action.time.toFixed(2)} s / ${clipDuration.toFixed(2)} s`;
   });
   lodSel.addEventListener('change', () => { lod = Number(lodSel.value); loadModel(); });
 

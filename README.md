@@ -30,6 +30,18 @@ textures, music and voice, 3D models with skeletal animations, texts and game da
 - Runs completely **locally**: a small server bound to `127.0.0.1` with a random access token, shown in its
   own app window (Microsoft Edge in app mode). Nothing is uploaded anywhere.
 
+## Screenshots
+
+**3D models** – textures and normal maps, detail levels (LOD), mesh list with visibility toggles, skeleton,
+export as GLB:
+
+![3D model viewer](docs/screenshot-model.png)
+
+**Skeletal animations** – matching animation files are suggested for every model; clips play with timeline,
+speed and loop while the camera follows the model, and model + animations can be exported together as GLB:
+
+![Skeletal animation playback](docs/animation.gif)
+
 ## Download
 
 Windows: download `NupExplorer.exe` from the [latest release](../../releases/latest) – no installation and no
@@ -129,7 +141,8 @@ NUP Explorer is an independent, fan-made tool. It is **not affiliated with, endo
 Nintendo**. The repository and the release contain **no game data, keys or copyrighted assets**, and the tool
 does not decrypt or circumvent any protection – it only reads unencrypted NUP files you provide.
 Use it only with files you are legally allowed to use. Extracted assets remain the property of their
-respective owners; do not redistribute them. All trademarks belong to their respective owners.
+respective owners; do not redistribute them. The screenshots show game assets for illustration only – all
+rights to them belong to their owners. All trademarks belong to their respective owners.
 
 ## License
 
