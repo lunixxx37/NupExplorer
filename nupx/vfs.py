@@ -4,7 +4,10 @@ Paths:
   romfs/Model/X.bfres.zs                    file in the merged container view
   romfs/Pack/Actor/A.pack.zs::Actor/B.bgyml file inside an archive (SARC)
   romfs/Pack/Actor/A.pack.zs::Actor/        directory inside an archive (trailing slash)
-Archives may be nested (a member can itself be an archive).
+  romfs/b6e28c40/0x8baaa1ce.fdata::0x7b7a00fe.g1t   entry of a Koei Tecmo pack (ktpack.py)
+  romfs/b6e28c40/USen/0x80e5ce0c.fdata::0x059f4a14.srsa::Rauru_VO_023.ka1a   sound of a KTSR bank (ktsr.py)
+Archives may be nested (a member can itself be an archive). Files with generic extensions (.bin, .file,
+.dat, none) get their type from their first bytes (Koei Tecmo packs, WebM videos).
 """
 from __future__ import annotations
 
@@ -13,31 +16,35 @@ import re
 import threading
 import zlib
 
+from . import ktsr
 from .anim import has_skeletal as has_skeletal_anims
 from .anim import skeletal_bone_names
 from .container import NupContainer
+from .ktpack import KtPack, is_pack
 from .sarc import Sarc
 from .util import ByteLRU
 from .zs import ZstdCodec, is_zstd
 
 TYPE_LABELS = {
     'texture': 'Texture', 'audio': 'Audio', 'model': '3D model', 'anim': 'Animation',
-    'msbt': 'Text (MSBT)', 'byml': 'Data (BYML)', 'archive': 'Archive', 'other': 'File',
+    'msbt': 'Text (MSBT)', 'byml': 'Data (BYML)', 'archive': 'Archive', 'video': 'Video', 'other': 'File',
 }
-ARCHIVE_EXTS = ('.pack', '.sarc', '.blarc', '.bfarc', '.msarc')
+ARCHIVE_EXTS = ('.pack', '.sarc', '.blarc', '.bfarc', '.msarc', '.fdata', '.srsa')  # .srsa: KTSR sound bank
+SNIFF_EXTS = ('.bin', '.file', '.dat')  # generic extensions: the type comes from the content
+WEBM_MAGIC = b'\x1aE\xdf\xa3'
 
 
 def classify(name: str) -> str:
     n = name.lower()
     if n.endswith('.zs'):
         n = n[:-3]
-    if n.endswith('.bntx'):
+    if n.endswith(('.bntx', '.g1t')):
         return 'texture'
-    if n.endswith('.bwav'):
+    if n.endswith(('.bwav', '.ka1a')):
         return 'audio'
-    if n.endswith('.anim.bfres'):
+    if n.endswith(('.anim.bfres', '.g2a', '.g1a')):
         return 'anim'
-    if n.endswith('.bfres'):
+    if n.endswith(('.bfres', '.g1m')):
         return 'model'
     if n.endswith('.msbt'):
         return 'msbt'
@@ -45,11 +52,24 @@ def classify(name: str) -> str:
         return 'byml'
     if n.endswith(ARCHIVE_EXTS):
         return 'archive'
+    if n.endswith(('.webm', '.mkv')):
+        return 'video'
     return 'other'
 
 
 def _sort_key(s: str):
     return s.lower()
+
+
+def _ktid(name: str, exts: tuple[str, ...]) -> int | None:
+    """KTID of a Koei Tecmo pack entry named 0x<KTID>.<ext> (ext one of exts), else None."""
+    low = name.lower()
+    if not (low.startswith('0x') and low.endswith(exts)):
+        return None
+    try:
+        return int(low[2:10], 16)
+    except ValueError:
+        return None
 
 
 def _variant_stem(stem: str) -> str:
@@ -66,8 +86,10 @@ def _camel_parents(tok: str) -> list[str]:
 
 
 class Archive:
-    def __init__(self, data: bytes):
-        self.sarc = Sarc(data)
+    """SARC archive (data) or Koei Tecmo pack (pack = ktpack.KtPack); .sarc is the reader either way."""
+
+    def __init__(self, data: bytes | None = None, pack=None, nbytes: int | None = None):
+        self.sarc = pack if pack is not None else Sarc(data)
         dirs: dict[str, tuple[set, list]] = {'': (set(), [])}
         for name in self.sarc.names():
             parent, _, base = name.rpartition('/')
@@ -80,12 +102,14 @@ class Archive:
                         dirs['/'.join(parts[:i])][0].add(parts[i])
             dirs[parent][1].append(base)
         self.dirs = {k: (sorted(v[0], key=_sort_key), sorted(v[1], key=_sort_key)) for k, v in dirs.items()}
-        self.nbytes = len(data)
+        self.nbytes = nbytes if nbytes is not None else len(data)
 
 
 class VFS:
     def __init__(self, nup_path: str, cache_dir: str | None = None, log=print):
         self.c = NupContainer(nup_path, cache_dir=cache_dir, log=log)
+        self.cache_dir, self.log = cache_dir, log
+        self._katana = None
         self.zstd = ZstdCodec()
         dic_path = 'romfs/Pack/ZsDic.pack.zs'
         if dic_path in self.c.files:
@@ -102,6 +126,8 @@ class VFS:
         self._bone_cache: dict[str, frozenset] = {}
         self._anims: list[str] | None = None
         self._models: list[str] | None = None
+        self._types: dict[str, str] = {}
+        self._ktsr_streams: list | None = None
         self._lock = threading.Lock()
 
     # ------------------------------------------------------------------ reading
@@ -134,20 +160,109 @@ class VFS:
             data = self.zstd.decompress(data)
         return data
 
+    def random_access(self, path: str):
+        """(read(offset, length), size, bytes held in memory): files the container stores unpacked are
+        read in place (Koei Tecmo packs can be larger than 1 GB), everything else is loaded."""
+        if '::' not in path and not self.c.is_packed(path):
+            read, size = self.c.reader(path)
+            return read, size, 0
+        data = self.read(path)
+        return (lambda o, n: data[o:o + n]), len(data), len(data)
+
     def open_archive(self, path: str) -> Archive:
         arc = self._archives.get(path)
         if arc is None:
-            data = self.read(path)
-            arc = Archive(data)
+            head = self.head(path, 0x20)
+            if is_pack(head):
+                read, size, held = self.random_access(path)
+                pack = KtPack(read, size)
+                arc = Archive(pack=pack, nbytes=held + 160 * len(pack.entries) + 4096)
+            elif ktsr.is_bank(head):
+                data = self.read(path)
+                bank = ktsr.BankArchive(data, find_stream=lambda b, p=path: self._find_ktsr_stream(p, b))
+                arc = Archive(pack=bank, nbytes=len(data) + 200 * len(bank.entries) + 4096)
+            else:
+                arc = Archive(self.read(path))
             self._archives.put(path, arc, arc.nbytes)
         return arc
 
-    # ------------------------------------------------------------------ listing
-    def _entry(self, name: str, path: str, size: int, layer: str | None = None) -> dict:
+    def _ktsr_stream_files(self) -> list:
+        """[(path, ktsr.StreamFile)] of all KTSR stream files (*.srst, also inside Koei Tecmo packs). Cached."""
+        if self._ktsr_streams is None:
+            out = []
+            for p in sorted(self.c.files):
+                low = p.lower()
+                try:
+                    if low.endswith('.srst'):
+                        read, size, _ = self.random_access(p)
+                        out.append((p, ktsr.StreamFile(read, size)))
+                    elif low.endswith(SNIFF_EXTS) and self.type_of(p) == 'archive':
+                        pack = self.open_archive(p).sarc
+                        for m in pack.names():
+                            if m.endswith('.srst'):
+                                r = pack.reader(m) if hasattr(pack, 'reader') else None
+                                if r is None:
+                                    d = pack.get(m)
+                                    r = (lambda o, n, d=d: d[o:o + n]), len(d)
+                                out.append((f'{p}::{m}', ktsr.StreamFile(*r)))
+                except Exception:  # noqa: BLE001 - not a stream file
+                    continue
+            self._ktsr_streams = out
+        return self._ktsr_streams
+
+    def _find_ktsr_stream(self, bank_path: str, bank) -> ktsr.StreamFile | None:
+        bank_dir = bank_path.split('::')[0].rpartition('/')[0]
+        return ktsr.find_stream(bank, self._ktsr_stream_files(), bank_dir)
+
+    def type_of(self, path: str) -> str:
+        """File type from the name; for generic extensions (.bin, .file ...) from the first bytes."""
+        name = path.rstrip('/').rpartition('::')[2].rpartition('/')[2]
         t = classify(name)
+        low = name.lower()
+        if t != 'other' or '::' in path or not (low.endswith(SNIFF_EXTS) or '.' not in low):
+            return t
+        hit = self._types.get(path)
+        if hit is None:
+            try:
+                h = self.c.read_head(path, 8)
+            except Exception:  # noqa: BLE001
+                h = b''
+            hit = 'archive' if is_pack(h) or h[:4] == b'SARC' else 'video' if h[:4] == WEBM_MAGIC else 'other'
+            self._types[path] = hit
+        return hit
+
+    # ------------------------------------------------------------------ listing
+    def describe(self, path: str, wait: bool = False) -> tuple[str | None, str | None]:
+        """(real name, description) for files only named by a hash (Koei Tecmo), once their index is loaded
+        (wait: load or build it first – exports; listings never wait)."""
+        k = self._katana
+        if k is None or k.loaded() is None:
+            if not wait:
+                return None, None
+            k = self.katana()
+            k.data()
+        return k.describe(path)
+
+    def export_name(self, path: str) -> str:
+        """File name for exports: the recovered real name of a file only named by a hash (Koei Tecmo), else the name."""
+        name = path.rstrip('/').rpartition('::')[2].rpartition('/')[2]
+        title = self.describe(path, wait='::' in path and path.split('::')[0].lower().endswith(('.fdata', '.file')))[0]
+        if title:
+            stem = re.sub(r'[\\/:*?"<>|]', '_', title).strip(' .')
+            if stem:
+                return f'{stem}.{name.rpartition(".")[2]}' if '.' in name else stem
+        return name
+
+    def _entry(self, name: str, path: str, size: int, layer: str | None = None) -> dict:
+        t = self.type_of(path)
         e = {'name': name, 'path': path, 'kind': 'file', 'type': t, 'size': size}
         if layer:
             e['layer'] = layer
+        title, desc = self.describe(path)
+        if title:
+            e['title'] = title
+        if desc:
+            e['desc'] = desc
         return e
 
     def list_dir(self, path: str) -> list[dict]:
@@ -159,12 +274,12 @@ class VFS:
                 p = prefix + d
                 sd, sf = self.c.dirs[p]
                 out.append({'name': d, 'path': p, 'kind': 'dir', 'count': len(sd) + len(sf)})
-            upd = self.c.layers[-1] if len(self.c.layers) > 1 else None
+            last = len(self.c.layers) - 1  # files from the update (the last section; names may be empty)
             for f in files:
                 p = prefix + f
                 off, size, _fi, li = self.c.files[p]
                 e = self._entry(f, p, size)
-                if upd and self.c.layers[li] == upd:
+                if last and li == last:
                     e['upd'] = 1
                 out.append(e)
             return out
@@ -188,7 +303,13 @@ class VFS:
 
     def meta(self, path: str) -> dict:
         name = path.rstrip('/').rpartition('::')[2].rpartition('/')[2]
-        m = {'path': path, 'name': name, 'type': classify(name), 'type_label': TYPE_LABELS[classify(name)]}
+        t = self.type_of(path)
+        m = {'path': path, 'name': name, 'type': t, 'type_label': TYPE_LABELS[t]}
+        title, desc = self.describe(path)
+        if title:
+            m['title'] = title
+        if desc:
+            m['desc'] = desc
         if '::' in path:
             arc_path, _, member = path.rpartition('::')
             arc = self.open_archive(arc_path)
@@ -198,6 +319,8 @@ class VFS:
             off, size, fi, li = self.c.files[path]
             m['size'] = size
             m['layer'] = self.c.layers[li]
+            m['layer_index'] = li
+            m['layer_count'] = len(self.c.layers)
             m['sha256'] = self.c.sha256(path)
         return m
 
@@ -209,26 +332,36 @@ class VFS:
 
     # ------------------------------------------------------------------ search
     def _search_index(self):
+        """[(path, lower-case search text, type, size)]: the container's files and – once the Koei Tecmo index is
+        loaded – the models, textures, animations, sound banks and sounds inside the packs (with their real names
+        and descriptions, so 'BGM' or 'still_tutorial' find them)."""
+        k = self._katana
+        katana = k is not None and k.loaded() is not None
         with self._lock:
-            if self._search_cache is None:
-                paths = sorted(self.c.files, key=str.lower)
-                self._search_cache = (paths, [p.lower() for p in paths], [classify(p) for p in paths])
-            return self._search_cache
+            if self._search_cache is None or self._search_cache[0] != katana:
+                rows = []
+                for p in sorted(self.c.files, key=str.lower):
+                    text = ' '.join(x for x in (p, *self.describe(p)) if x)
+                    rows.append((p, text.lower(), self.type_of(p), self.c.files[p][1]))
+                if katana:
+                    for path, title, text, _ext, size in k.search_entries():
+                        rows.append((path, (path + ' ' + text).lower(), classify(path.rpartition('::')[2]), size))
+                self._search_cache = (katana, rows)
+            return self._search_cache[1]
 
     def search(self, q: str, ftype: str | None = None, limit: int = 5000) -> dict:
-        paths, lower, types = self._search_index()
+        rows = self._search_index()
         terms = q.lower().split()
         hits = []
         total = 0
-        for i, lp in enumerate(lower):
-            if ftype and types[i] != ftype:
+        for p, text, t, size in rows:
+            if ftype and t != ftype:
                 continue
-            if terms and not all(t in lp for t in terms):
+            if terms and not all(term in text for term in terms):
                 continue
             total += 1
             if len(hits) < limit:
-                p = paths[i]
-                hits.append(self._entry(p.rpartition('/')[2], p, self.c.files[p][1]))
+                hits.append(self._entry(p.rpartition('::')[2].rpartition('/')[2], p, size))
         return {'total': total, 'items': hits}
 
     # ------------------------------------------------------------------ helpers
@@ -249,7 +382,16 @@ class VFS:
                 self._tex_index = idx
             return self._tex_index
 
+    def katana(self):
+        """Koei Tecmo resource links (textures of G1M models), see katana.py."""
+        if self._katana is None:
+            from .katana import KatanaIndex
+            self._katana = KatanaIndex(self, self.cache_dir, self.log)
+        return self._katana
+
     def find_texture(self, name: str) -> str | None:
+        if '::' in name:  # a path (textures of Koei Tecmo models are named by the path of their G1T file)
+            return name if self.exists(name) else None
         idx = self.texture_index()
         key = name.lower()
         p = idx.get(key)
@@ -264,7 +406,12 @@ class VFS:
 
     def head(self, path: str, n: int) -> bytes:
         """The first n bytes after removing the zstd layer, without unpacking the whole file."""
-        data = self.read_stored(path) if '::' in path else self.c.read_head(path, n + 0x20100)
+        if '::' in path:
+            arc_path, _, member = path.rpartition('::')
+            pack = self.open_archive(arc_path).sarc
+            data = pack.head(member, n) if hasattr(pack, 'head') else pack.get(member)
+        else:
+            data = self.c.read_head(path, n + 0x20100)
         return self.zstd.decompress(data, head=n) if is_zstd(data) else data[:n]
 
     def has_skeletal(self, path: str) -> bool:
@@ -295,8 +442,13 @@ class VFS:
         Ranked: animations named after the model (Animal_Cow -> Animal_Cow_Animation, Driver_YoshiIce ->
         DriverA_YoshiIce_Kart), then those of the base character (Driver_YoshiIce -> DriverA_Yoshi_Kart).
         The latter are only kept if they animate at least half of the model's bones (bones = its skeleton).
+        Koei Tecmo models (G1M): by the game's resource links and bone ids, see katana.py.
         """
         base = model_path.rpartition('::')[2].rpartition('/')[2]
+        ktid = _ktid(base, ('.g1m',))
+        if ktid is not None:
+            k = self.katana()
+            return [p for a in k.anim_candidates(ktid, max(limit, 300)) if (p := k.path(a, 'anim'))]
         stem = re.sub(r'\.(bfres)(\.zs)?$', '', base, flags=re.I)
         keys = [k for k in dict.fromkeys(stem.split('.')) if k]
         roots: dict[str, int] = {}  # root -> tier (0 = model name, 1 = camel-case parent)
@@ -345,8 +497,13 @@ class VFS:
         Ranked: the model named in the animation (Dm_Graveyard_0010_Player_Child -> Player_Child,
         DriverA_Yoshi_Kart -> Driver_Yoshi), then its costumes (Driver_YoshiIce), then the base character
         of a costume animation (DriverA_YoshiIce_Kart -> Driver_Yoshi).
+        Koei Tecmo animations (G1A/G2A): models whose skeleton has their bones, see katana.py.
         """
         base = anim_path.rpartition('::')[2].rpartition('/')[2]
+        ktid = _ktid(base, ('.g2a', '.g1a'))
+        if ktid is not None:
+            k = self.katana()
+            return [p for m in k.model_candidates(ktid, limit) if (p := k.path(m, 'g1m'))]
         stem = base.split('.anim.')[0]
         stem = re.sub(r'_Animation$', '', stem)
         roots: list[tuple[str, int]] = []  # (root, tier) in order of preference
@@ -386,6 +543,16 @@ class VFS:
                 scored.append((best, n.lower(), p))
         scored.sort()
         return [p for *_, p in scored[:limit]]
+
+    def anim_label(self, path: str) -> str | None:
+        """Short description of a Koei Tecmo animation file for lists (its name is only a hash)."""
+        base = path.rpartition('::')[2].rpartition('/')[2]
+        ktid = _ktid(base, ('.g2a', '.g1a'))
+        info = self.katana().anim_info(ktid) if ktid is not None else None
+        if not info:
+            return None
+        fmt, fps, length, nbones = info
+        return f'{base} · {length / (fps or 60):.1f} s · {nbones} bones'
 
     def all_anims(self) -> list[str]:
         if self._anims is None:

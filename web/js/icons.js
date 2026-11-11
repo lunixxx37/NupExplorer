@@ -31,6 +31,10 @@ const PATHS = {
   volume: '<path d="M4 9.5h3.2L12 5.5v13l-4.8-4H4z"/><path d="M15.5 9.2a4 4 0 0 1 0 5.6M18.2 6.6a7.6 7.6 0 0 1 0 10.8"/>',
   keyboard: '<rect x="2.8" y="6" width="18.4" height="12" rx="2.6"/><path d="M6.5 9.5h.1M10 9.5h.1M13.5 9.5h.1M17 9.5h.1M7.5 14.5h9"/>',
   spark: '<path d="M12 3v4M12 17v4M3 12h4M17 12h4M5.6 5.6l2.6 2.6M15.8 15.8l2.6 2.6M18.4 5.6l-2.6 2.6M8.2 15.8l-2.6 2.6"/>',
+  video: '<rect x="3" y="5" width="18" height="14" rx="3"/><path d="m10 9.2 4.8 2.8-4.8 2.8z" ' + F + '/>',
+  sliders: '<path d="M4 7h8.5M17.5 7H20M4 17h2.5M11.5 17H20"/><circle cx="15" cy="7" r="2.5"/><circle cx="9" cy="17" r="2.5"/>',
+  update: '<circle cx="12" cy="12" r="8.6"/><path d="M12 16.4V7.8M8.3 11.3 12 7.6l3.7 3.7"/>',
+  external: '<path d="M14 4h6v6M20 4l-8.5 8.5"/><path d="M18.5 13.5v4.6a1.9 1.9 0 0 1-1.9 1.9H5.9A1.9 1.9 0 0 1 4 18.1V7.4a1.9 1.9 0 0 1 1.9-1.9h4.6"/>',
 };
 
 const cache = new Map();
@@ -66,5 +70,6 @@ export const TYPES = {
   anim: { icon: 'anim', label: 'Animation' },
   msbt: { icon: 'msbt', label: 'Text (MSBT)' },
   byml: { icon: 'byml', label: 'Data (BYML)' },
+  video: { icon: 'video', label: 'Video' },
   other: { icon: 'other', label: 'File' },
 };

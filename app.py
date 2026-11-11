@@ -126,6 +126,7 @@ def main():
     srv = make_server('127.0.0.1', port, app, threaded=True)
     state.port = srv.server_port
     threading.Thread(target=srv.serve_forever, name='http', daemon=True).start()
+    state.updates.start()  # asks GitHub for a newer release (can be switched off in the UI)
 
     nup = args.nup or settings.get('last_nup')
     if nup and os.path.isfile(nup):

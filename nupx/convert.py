@@ -3,11 +3,11 @@ from __future__ import annotations
 
 import re
 
-from . import audio, bfres, byml, gltf, msbt, textures
-from .vfs import VFS, classify
+from . import audio, bfres, byml, g1m, gltf, msbt, objfile, textures
+from .vfs import VFS
 
-_STRIP = [(re.compile(r'\.bntx(\.zs)?$', re.I), ''), (re.compile(r'\.bwav$', re.I), ''),
-          (re.compile(r'\.bfres(\.zs)?$', re.I), ''), (re.compile(r'\.msbt$', re.I), ''),
+_STRIP = [(re.compile(r'\.(bntx|g1t)(\.zs)?$', re.I), ''), (re.compile(r'\.(bwav|ka1a)$', re.I), ''),
+          (re.compile(r'\.(bfres|g1m)(\.zs)?$', re.I), ''), (re.compile(r'\.msbt$', re.I), ''),
           (re.compile(r'\.b?g?yml(\.zs)?$', re.I), ''), (re.compile(r'\.byml(\.zs)?$', re.I), '')]
 
 
@@ -23,12 +23,30 @@ def raw_name(name: str) -> str:
     return name[:-3] if name.lower().endswith('.zs') else name
 
 
+def load_models(vfs: VFS, path: str, raw: bytes | None = None) -> list:
+    """Models of a BFRES or G1M file; G1M textures are looked up in the game's resource links."""
+    raw = vfs.read(path) if raw is None else raw
+    if not g1m.is_g1m(raw):
+        return bfres.parse_models(raw)
+    stem = path.rpartition('::')[2].rpartition('/')[2].rpartition('.')[0]
+    models = g1m.parse_models(raw, stem)
+    try:
+        ktid = int(stem[2:10], 16) if stem.startswith('0x') else None
+    except ValueError:
+        ktid = None
+    if ktid is not None:
+        paths = vfs.katana().model_textures(ktid)
+        for m in models:
+            m.set_textures(paths)
+    return models
+
+
 def _decode_named(vfs: VFS, name: str, maxdim: int | None):
     p = vfs.find_texture(name)
     if not p:
         return None
     raw = vfs.read(p)
-    t = textures.parse_bntx(raw)[0]
+    t = textures.parse(raw)[0]
     return textures.decode(raw, t, textures.choose_mip(t, maxdim)), t
 
 
@@ -118,44 +136,88 @@ def texture_png_for_model(vfs: VFS, name: str, kind: str, maxdim: int | None = 1
     return textures.png_bytes(img, level), (kind == 'color' and textures.has_alpha(img))
 
 
-def convert_file(vfs: VFS, path: str, fmt: str | None = None) -> list[tuple[str, bytes]]:
-    """Convert one file to a viewable format. Returns [(file name, bytes)]."""
-    name = path.rpartition('::')[2].rpartition('/')[2]
-    t = classify(name)
+# converted export formats per file type: {type: {key: label}}; the first one is the default
+EXPORT_FORMATS = {
+    'audio': {k: label for k, (label, _ext) in audio.FORMATS.items()},
+    'texture': textures.EXPORT_FORMATS,
+    'model': {'glb': 'GLB (textures embedded)', 'gltf': 'glTF + .bin + PNG textures',
+              'obj': 'OBJ + MTL (static, no skeleton)'},
+    'msbt': {'json': 'JSON', 'csv': 'CSV'},
+    'byml': {'yml': 'YAML', 'json': 'JSON'},
+}
+DEFAULT_FORMATS = {t: next(iter(opts)) for t, opts in EXPORT_FORMATS.items()}
+
+
+def normalize_formats(formats: dict | None) -> dict:
+    """Known formats only, defaults for the rest."""
+    out = dict(DEFAULT_FORMATS)
+    for t, f in (formats or {}).items():
+        if f in EXPORT_FORMATS.get(t, {}):
+            out[t] = f
+    return out
+
+
+def convert_file(vfs: VFS, path: str, fmt: str | None = None, formats: dict | None = None) -> list[tuple[str, bytes]]:
+    """Convert one file to a viewable format. Returns [(file name, bytes)].
+
+    formats: export format per file type (see EXPORT_FORMATS); fmt overrides it for this file's type."""
+    name = vfs.export_name(path)  # the real name where a Koei Tecmo game has one
+    t = vfs.type_of(path)
     data = vfs.read(path)
     base = base_name(name)
+    fmts = normalize_formats(formats)
+    if fmt and fmt in EXPORT_FORMATS.get(t, {}):
+        fmts[t] = fmt
     if t == 'texture':
-        texs = textures.parse_bntx(data)
+        texs = textures.parse(data)
         out = []
         for tex in texs:
             if not tex.supported():
                 continue
             stem = base if len(texs) == 1 else f'{base}_{tex.name}'
+            if fmts['texture'] == 'dds' and not (tex.tdim == 2 and tex.depth > 1):  # 3D textures: images
+                out.append((f'{stem}.dds', textures.dds_bytes(data, tex)))
+                continue
             for layer in range(tex.layers):
                 img = textures.decode(data, tex, 0, layer)
                 suffix = f'_L{layer}' if tex.layers > 1 else ''
-                out.append((f'{stem}{suffix}.png', textures.png_bytes(img, 6)))
+                if fmts['texture'] == 'tga':
+                    out.append((f'{stem}{suffix}.tga', textures.tga_bytes(img)))
+                else:
+                    out.append((f'{stem}{suffix}.png', textures.png_bytes(img, 6)))
         if not out:
             raise ValueError('No supported texture format')
         return out
     if t == 'audio':
         pcm, rate, _info = audio.decode(data)
-        return [(base + '.wav', audio.wav_bytes(pcm, rate))]
+        ext, encoded = audio.encode(pcm, rate, fmts['audio'])
+        return [(base + ext, encoded)]
     if t == 'model':
-        models = bfres.parse_models(data)
+        models = load_models(vfs, path, data)
         if not models or all(s.cluster_error for m in models for s in m.shapes):  # nothing to convert: raw file
             return [(raw_name(name), data)]
-        glb = gltf.build_glb(models, 0, texture_png=lambda n, k: texture_png_for_model(vfs, n, k, None, 6),
-                             extras={'source': path}, fallback_color=lambda mt: ramp_color(vfs, mt))
+        png = lambda n, k: texture_png_for_model(vfs, n, k, None, 6)  # noqa: E731
+        colour = lambda mt: ramp_color(vfs, mt)  # noqa: E731
+        if fmts['model'] == 'gltf':
+            return gltf.build_gltf(models, base, 0, texture_png=png, extras={'source': path}, fallback_color=colour)
+        if fmts['model'] == 'obj':
+            return objfile.build_obj(models, base, 0, texture_png=png, fallback_color=colour)
+        glb = gltf.build_glb(models, 0, texture_png=png, extras={'source': path}, fallback_color=colour)
         return [(base + '.glb', glb)]
     if t == 'msbt':
         parsed = msbt.parse(data)
-        if fmt == 'csv':
+        if fmts['msbt'] == 'csv':
             return [(base + '.csv', msbt.to_csv(parsed))]
         return [(base + '.json', msbt.to_json(parsed))]
     if t == 'byml':
         obj = byml.parse(data)
-        if fmt == 'json':
+        if fmts['byml'] == 'json':
             return [(base + '.json', byml.to_json(obj))]
         return [(base + '.yml', byml.to_yaml(obj).encode('utf-8'))]
+    if t == 'video':  # WebM videos (Koei Tecmo stores them as .bin)
+        return [(raw_name(name).rpartition('.')[0] + '.webm' if '.' in name else name + '.webm', data)]
+    low = name.lower()
+    if low.endswith(('.srsa', '.srst')) and data[16:20] == b'KTSR':
+        # Koei Tecmo sound: the KTSR inside the 16-byte SRSA/SRST wrapper, under the names vgmstream knows
+        return [(name.rpartition('.')[0] + ('.ktsl2asbin' if low.endswith('.srsa') else '.ktsl2stbin'), data[16:])]
     return [(raw_name(name), data)]

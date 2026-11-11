@@ -149,6 +149,8 @@ export function show(root, meta, ctx = {}) {
   const expMsg = el('div', { class: 'small muted' });
   const expClipBtn = el('button', { class: 'btn', disabled: true, title: 'Model + selected animation as .glb into the export folder' }, icon('export'), 'GLB + clip');
   const expAllBtn = el('button', { class: 'btn', disabled: true, title: 'Model + all animations of the file as .glb into the export folder' }, icon('export'), 'GLB + all clips');
+  const expFilesBtn = el('button', { class: 'btn', disabled: true, style: 'display:none',
+    title: 'Model + every animation of all files in the list above as one .glb into the export folder' }, icon('export'), 'GLB + all files');
 
   const modelSel = el('select', { class: 'sel wide' });
   const modelSearch = el('input', { class: 'inp wide', placeholder: 'Search model…', list: 'model-all' });
@@ -167,7 +169,7 @@ export function show(root, meta, ctx = {}) {
       el('label', { class: 'check small', title: 'Cutscenes are often recorded far away from the origin – the camera follows the model' },
         cbFollow, 'Camera follows the model'),
       slider, tLabel, animMsg,
-      el('div', { class: 'row' }, expClipBtn, expAllBtn), expMsg),
+      el('div', { class: 'row' }, expClipBtn, expAllBtn, expFilesBtn), expMsg),
     el('section', {}, el('h4', {}, 'Info'), infoBox),
   );
 
@@ -351,6 +353,10 @@ export function show(root, meta, ctx = {}) {
             title: `${s.material} · ${s.triangles} triangles${why}`,
           }, cb, s.name));
         }
+        if (m.skipped && m.skipped.length) {
+          meshList.append(el('div', { class: 'small muted', title: m.skipped.join(', ') },
+            `${m.skipped.length} cloth mesh${m.skipped.length > 1 ? 'es' : ''} not shown (positioned by the game's cloth simulation)`));
+        }
       }
       applyVisibility(true);
       const lc = Math.max(1, ...(ex.models || []).map((m) => m.lod_count || 1));
@@ -389,16 +395,19 @@ export function show(root, meta, ctx = {}) {
   }
 
   // ------------------------------------------------------------ animations
-  async function loadAnimList() {
+  async function loadAnimList(reloadClips = true) {
     try {
       const sug = await getJSON('/api/anim/suggest', { model: modelPath || '' });
-      const sugList = isAnimFile ? [meta.path] : sug.suggested;
+      // an opened animation file comes first, followed by the other animation files of the model
+      const sugList = isAnimFile ? [meta.path, ...sug.suggested.filter((p) => p !== meta.path)] : sug.suggested;
+      const labels = sug.labels || {};
       animSel.replaceChildren(el('option', { value: '' }, sugList.length ? '— choose an animation file —' : '— no matching file found —'),
-        ...sugList.map((p) => el('option', { value: p, selected: p === animPath }, baseName(p))));
+        ...sugList.map((p) => el('option', { value: p, selected: p === animPath }, labels[p] || baseName(p))));
       animList.replaceChildren(...sug.all.map((p) => el('option', { value: baseName(p) })));
       animList._map = new Map(sug.all.map((p) => [baseName(p), p]));
       if (!animPath && sug.suggested.length) { animPath = sug.suggested[0]; animSel.value = animPath; }
-      if (animPath) await loadClips();
+      if (animPath && reloadClips) await loadClips();
+      updateExportButtons();
     } catch (e) { animMsg.textContent = `Error: ${e.message}`; }
   }
 
@@ -496,24 +505,54 @@ export function show(root, meta, ctx = {}) {
   });
   clipSel.addEventListener('change', () => playClip(Number(clipSel.value)));
 
-  async function exportGlb(all) {
-    if (!modelPath || !animPath) return;
-    const body = { model: modelPath, anim: animPath };
-    if (!all) body.clip = Number(clipSel.value);
-    expMsg.textContent = 'Exporting GLB…';
-    expClipBtn.disabled = true; expAllBtn.disabled = true;
+  // animation files listed in the chooser (suggestions + files picked via search)
+  const animFiles = () => [...animSel.options].map((o) => o.value).filter(Boolean);
+
+  async function exportGlb(mode) {  // 'clip' | 'file' (all clips of this file) | 'files' (all listed files)
+    const files = animFiles();
+    if (!modelPath || (mode === 'files' ? !files.length : !animPath)) return;
+    const body = { model: modelPath };
+    if (mode === 'files') body.anims = files; else body.anim = animPath;
+    if (mode === 'clip') body.clip = Number(clipSel.value);
+    expClipBtn.disabled = true; expAllBtn.disabled = true; expFilesBtn.disabled = true;
     try {
+      if (mode === 'files') {
+        // big characters can have well over a thousand clips: say so before a long export
+        expMsg.textContent = `Counting the animations in ${files.length} files…`;
+        const lists = await Promise.all(files.map((p) => getJSON('/api/anim/clips', { path: p })));
+        const total = lists.reduce((n, r) => n + r.clips.filter((c) => c.supported).length, 0);
+        if (total > 400 && !window.confirm(`${total.toLocaleString('en-US')} animations from ${files.length} files will go into one GLB. `
+          + 'A file this big can take minutes to export and to import (several hundred MB). Export anyway?')) {
+          expMsg.textContent = 'Cancelled';
+          updateExportButtons();
+          return;
+        }
+        expMsg.textContent = `Exporting GLB with ${total.toLocaleString('en-US')} animations from ${files.length} files…`;
+      } else {
+        expMsg.textContent = 'Exporting GLB…';
+      }
       const r = await postJSON('/api/export/model-glb', body);
-      expMsg.textContent = r.ok ? `Saved: ${r.path} (${r.clips} animation${r.clips === 1 ? '' : 's'}, ${formatSize(r.size)})` : 'Cancelled';
+      if (!r.ok) {
+        expMsg.textContent = 'Cancelled';
+      } else {
+        const from = r.files > 1 ? ` from ${r.files} files` : '';
+        const skipped = r.skipped ? `, ${r.skipped} skipped (rotation mode not supported)` : '';
+        expMsg.textContent = `Saved: ${r.path} (${r.clips} animation${r.clips === 1 ? '' : 's'}${from}${skipped}, ${formatSize(r.size)})`;
+      }
     } catch (e) { expMsg.textContent = `Error: ${e.message}`; }
     updateExportButtons();
   }
   function updateExportButtons() {
     expAllBtn.disabled = !(modelRoot && animPath && clipSel.options.length);
     expClipBtn.disabled = !(modelRoot && animPath && clipSel.value !== '');
+    const n = animFiles().length;
+    expFilesBtn.replaceChildren(icon('export'), `GLB + all files (${n})`);
+    expFilesBtn.style.display = n > 1 ? '' : 'none';
+    expFilesBtn.disabled = !(modelRoot && n > 1);
   }
-  expClipBtn.addEventListener('click', () => exportGlb(false));
-  expAllBtn.addEventListener('click', () => exportGlb(true));
+  expClipBtn.addEventListener('click', () => exportGlb('clip'));
+  expAllBtn.addEventListener('click', () => exportGlb('file'));
+  expFilesBtn.addEventListener('click', () => exportGlb('files'));
   clipSel.addEventListener('change', updateExportButtons);
   animSel.addEventListener('change', updateExportButtons);
   playBtn.addEventListener('click', () => {
@@ -547,7 +586,8 @@ export function show(root, meta, ctx = {}) {
       modelList._map = new Map(res.items.map((i) => [i.name, i.path]));
     } catch { /* optional */ }
   }
-  modelSel.addEventListener('change', () => { modelPath = modelSel.value || null; framed = false; loadModel(); });
+  // another model for an animation file: also refresh the list of that model's animation files
+  modelSel.addEventListener('change', () => { modelPath = modelSel.value || null; framed = false; loadModel().then(() => loadAnimList(false)); });
   modelSearch.addEventListener('change', () => {
     const p = modelList._map && modelList._map.get(modelSearch.value);
     if (!p) return;
@@ -555,7 +595,7 @@ export function show(root, meta, ctx = {}) {
     if (![...modelSel.options].some((o) => o.value === p)) modelSel.append(el('option', { value: p }, baseName(p)));
     modelSel.value = p;
     framed = false;
-    loadModel();
+    loadModel().then(() => loadAnimList(false));
   });
 
   // ------------------------------------------------------------ render loop

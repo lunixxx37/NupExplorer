@@ -15,10 +15,13 @@
 <body>
 <header id="topbar">
   <button id="btnHome" class="brand" title="Home"><img class="logo" src="logo.svg" alt=""><span class="brand-name"><b>NUP</b> Explorer</span></button>
+  <button id="btnVersion" class="ver-pill hidden" title="Version and updates"></button>
+  <button id="btnUpdate" class="update-pill hidden"><span data-icon="update"></span><span class="lbl">Update</span></button>
   <div id="nupinfo" class="file-chip hidden"></div>
   <div class="spacer"></div>
   <span id="conn" class="status-pill" title="Connection to the background process"><span class="dot"></span><span class="lbl">Connected</span></span>
   <button id="btnOpen" class="btn"><span data-icon="open"></span>Open file…</button>
+  <button id="btnFormats" class="btn" title="Formats for “Export” (converted)"><span data-icon="sliders"></span>Formats</button>
   <button id="btnTarget" class="btn"><span data-icon="target"></span><span id="targetLabel">Export folder</span></button>
 </header>
 <main id="layout">
@@ -38,6 +41,8 @@
 </main>
 <footer id="statusbar"></footer>
 <div id="ctxmenu" class="menu hidden"></div>
+<div id="fmtmenu" class="menu hidden"></div>
+<div id="aboutmenu" class="menu hidden"></div>
 <div id="toast"></div>
 </body>
 </html>

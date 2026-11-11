@@ -65,6 +65,14 @@ class TexInfo:
                 'supported': self.supported(), 'image_size': self.image_size}
 
 
+def parse(raw: bytes) -> list:
+    """Textures of a BNTX (Nintendo) or G1T (Koei Tecmo) file."""
+    if raw[:4] == b'GT1G':
+        from . import g1t
+        return g1t.parse(raw)
+    return parse_bntx(raw)
+
+
 def parse_bntx(raw: bytes) -> list[TexInfo]:
     if raw[:4] != b'BNTX':
         raise ValueError('Not a BNTX file')
@@ -287,8 +295,20 @@ def _apply_comp_sel(rgba: np.ndarray, sel) -> np.ndarray:
 
 def decode(raw: bytes, t: TexInfo, mip: int = 0, layer: int = 0, swizzle: bool = True) -> np.ndarray:
     """Decode one mip level of one array layer to RGBA uint8 (h, w, 4)."""
+    if not isinstance(t, TexInfo):  # G1T
+        from . import g1t
+        return g1t.decode(raw, t, mip, layer)
     if not t.supported():
         raise ValueError(f'Texture format {t.format_name()} ({t.fmt:#06x}) is not supported')
+    lin, w, h, wb, hb = linear_data(raw, t, mip, layer)
+    rgba = _decode_linear(lin, t, w, h, wb, hb)
+    if swizzle:
+        rgba = _apply_comp_sel(rgba, t.comp_sel)
+    return np.ascontiguousarray(rgba)
+
+
+def linear_data(raw: bytes, t: TexInfo, mip: int = 0, layer: int = 0) -> tuple[bytes, int, int, int, int]:
+    """Deswizzled (row-major) block data of one mip level of one array layer: (data, w, h, blocks w, blocks h)."""
     mip = max(0, min(mip, t.mips - 1))
     layer = max(0, min(layer, t.layers - 1))
     _, bw, bh, bpp = FORMATS[t.ftype]
@@ -301,15 +321,16 @@ def decode(raw: bytes, t: TexInfo, mip: int = 0, layer: int = 0, swizzle: bool =
         lin = deswizzle(data, wb, hb, bpp, bhl)
     else:
         lin = bytes(data[:wb * hb * bpp])
-    rgba = _decode_linear(lin, t, w, h, wb, hb)
-    if swizzle:
-        rgba = _apply_comp_sel(rgba, t.comp_sel)
-    return np.ascontiguousarray(rgba)
+    return lin, w, h, wb, hb
 
 
 def to_normal_map(rgba: np.ndarray, t: TexInfo) -> np.ndarray:
     """Turn a 2-channel normal map (X in R, Y in G after swizzle) into a full RGB normal map."""
-    if t.comp_sel[2] not in (0, 1):
+    sel = getattr(t, 'comp_sel', None)
+    if sel is None:  # G1T: two-channel formats (BC5) have an empty blue channel
+        if t.format_name().split()[0] not in ('BC5', 'BC5U', 'BC5S'):
+            return rgba
+    elif sel[2] not in (0, 1):
         return rgba  # blue channel carries data: already a 3-channel normal map
     x = rgba[..., 0].astype(np.float32) / 127.5 - 1.0
     y = rgba[..., 1].astype(np.float32) / 127.5 - 1.0
@@ -326,6 +347,67 @@ def png_bytes(rgba: np.ndarray, level: int = 1) -> bytes:
     bio = io.BytesIO()
     Image.fromarray(rgba, 'RGBA').save(bio, 'PNG', compress_level=level)
     return bio.getvalue()
+
+
+def tga_bytes(rgba: np.ndarray) -> bytes:
+    bio = io.BytesIO()
+    Image.fromarray(rgba, 'RGBA').save(bio, 'TGA', compression='tga_rle')
+    return bio.getvalue()
+
+
+# export formats: key -> label
+EXPORT_FORMATS = {'png': 'PNG', 'tga': 'TGA', 'dds': 'DDS (original data, all mipmaps)'}
+
+# BNTX (type byte, kind) -> DXGI format, for DDS files that keep the original data
+_DXGI = {
+    (0x02, 1): 61, (0x02, 2): 63,                                  # R8
+    (0x07, 1): 85,                                                 # R5G6B5 (DXGI B5G6R5: red in the high bits)
+    (0x09, 1): 49, (0x09, 2): 51,                                  # R8G8
+    (0x0a, 1): 56, (0x0a, 2): 58, (0x0a, 5): 54,                   # R16
+    (0x0b, 1): 28, (0x0b, 6): 29, (0x0b, 2): 31,                   # R8G8B8A8
+    (0x0c, 1): 87, (0x0c, 6): 91,                                  # B8G8R8A8
+    (0x0e, 1): 24,                                                 # R10G10B10A2
+    (0x0f, 5): 26, (0x0f, 0x0a): 26,                               # R11G11B10 float
+    (0x12, 1): 35, (0x12, 2): 37, (0x12, 5): 34,                   # R16G16
+    (0x15, 5): 10, (0x15, 1): 11, (0x15, 2): 13,                   # R16G16B16A16
+    (0x1a, 1): 71, (0x1a, 6): 72, (0x1b, 1): 74, (0x1b, 6): 75,    # BC1, BC2
+    (0x1c, 1): 77, (0x1c, 6): 78, (0x1d, 1): 80, (0x1d, 2): 81,    # BC3, BC4
+    (0x1e, 1): 83, (0x1e, 2): 84, (0x1f, 0x0a): 95, (0x1f, 5): 96,  # BC5, BC6H
+    (0x20, 1): 98, (0x20, 6): 99,                                  # BC7
+}
+
+
+def dds_bytes(raw: bytes, t: TexInfo) -> bytes:
+    """DDS (DX10 header) with every mip level and array layer / cube face.
+
+    Formats DDS can hold keep their original data (BC1-BC7 stay compressed, no channel mapping applied);
+    ASTC and other formats are decoded to RGBA8 (with the channel mapping)."""
+    if not isinstance(t, TexInfo):  # G1T
+        from . import g1t
+        return g1t.dds_bytes(raw, t)
+    if t.tdim == 2 and t.depth > 1:
+        raise ValueError('3D textures cannot be written as DDS')
+    if not t.supported():
+        raise ValueError(f'Texture format {t.format_name()} ({t.fmt:#06x}) is not supported')
+    dxgi = None if t.ftype in ASTC_BLOCKS else _DXGI.get((t.ftype, t.kind))
+    native = dxgi is not None
+    if not native:
+        dxgi = 29 if t.kind == 6 else 28  # R8G8B8A8 (sRGB)
+    parts = []
+    for layer in range(t.layers):  # DDS order: every array slice with all its mips
+        for mip in range(t.mips):
+            parts.append(linear_data(raw, t, mip, layer)[0] if native else decode(raw, t, mip, layer).tobytes())
+    _, bw, _bh, bpp = FORMATS[t.ftype] if native else (None, 1, 1, 4)
+    compressed = native and bw > 1
+    first = len(parts[0]) if compressed else t.width * bpp
+    cube = t.tdim in (3, 8) and t.layers % 6 == 0
+    flags = 0x1 | 0x2 | 0x4 | 0x1000 | (0x20000 if t.mips > 1 else 0) | (0x80000 if compressed else 0x8)
+    caps = 0x1000 | (0x400008 if t.mips > 1 else 0) | (0x8 if cube else 0)
+    pixel_format = struct.pack('<II4s5I', 32, 0x4, b'DX10', 0, 0, 0, 0, 0)
+    header = (struct.pack('<7I', 124, flags, t.height, t.width, first, 0, t.mips) + bytes(44) + pixel_format
+              + struct.pack('<5I', caps, 0xFE00 if cube else 0, 0, 0, 0))
+    dx10 = struct.pack('<5I', dxgi, 3, 0x4 if cube else 0, t.layers // 6 if cube else t.layers, 0)
+    return b'DDS ' + header + dx10 + b''.join(parts)
 
 
 def has_alpha(rgba: np.ndarray) -> bool:

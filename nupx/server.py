@@ -12,17 +12,18 @@ import threading
 import time
 import traceback
 import urllib.parse
+import webbrowser
 import zipfile
 
-import numpy as np
 from flask import Flask, Response, abort, jsonify, request
 
 from . import anim as A
 from . import audio, bfres, byml, gltf, msbt, textures
-from .convert import (base_name, convert_file, eye_available, eye_composite, ramp_color, raw_name,
-                      texture_png_for_model)
+from .convert import (EXPORT_FORMATS, base_name, convert_file, eye_available, eye_composite, load_models,
+                      normalize_formats, ramp_color, raw_name, texture_png_for_model)
 from .dialogs import Dialogs
 from .export import ExportManager
+from .updates import REPO_URL, UpdateChecker
 from .util import ByteLRU
 from .vfs import VFS, classify
 
@@ -31,7 +32,7 @@ mimetypes.add_type('application/javascript', '.mjs')
 mimetypes.add_type('text/css', '.css')
 mimetypes.add_type('image/svg+xml', '.svg')
 
-VERSION = '1.1.0'
+VERSION = '1.2.0'
 
 
 class State:
@@ -49,6 +50,7 @@ class State:
         self.png = ByteLRU(512 << 20)
         self.wav = ByteLRU(768 << 20)
         self.glb = ByteLRU(384 << 20)
+        self.video = (None, None)  # (path, bytes) of the last video that had to be loaded completely
         self.models = ByteLRU(512 << 20)
         self.anims = ByteLRU(256 << 20)
         self.clips = ByteLRU(256 << 20)
@@ -58,6 +60,8 @@ class State:
         self.last_disconnect = time.time()
         self.dialogs = Dialogs()
         self.export = ExportManager(self.emit)
+        # started by app.py (tests that create a State stay offline)
+        self.updates = UpdateChecker(VERSION, settings, lambda: self.emit('state', self.state_dict()), log)
 
     # ---------------------------------------------------------------- events
     def emit(self, event: str, data):
@@ -85,10 +89,14 @@ class State:
 
     # ---------------------------------------------------------------- container
     def state_dict(self) -> dict:
+        k = self.vfs._katana if self.vfs else None
         return {'loading': self.loading, 'error': self.error, 'version': VERSION,
                 'nup': self.vfs.c.info() if self.vfs else None,
+                'labels': bool(k is not None and k.loaded() is not None),  # Koei Tecmo names/descriptions ready
                 'export_dir': self.settings.get('export_dir') or '',
-                'export': self.export.status()}
+                'formats': normalize_formats(self.settings.get('formats')),
+                'export': self.export.status(),
+                'update': self.updates.status()}
 
     def open_nup(self, path: str):
         if self.loading:
@@ -104,12 +112,22 @@ class State:
                 self.vfs = v
                 for c in (self.png, self.wav, self.glb, self.models, self.anims, self.clips):
                     c.clear()
+                self.video = (None, None)
                 if old is not None:
                     old.close()
                 self.settings['last_nup'] = os.path.abspath(path)
                 if not self.settings.get('export_dir'):
                     self.settings['export_dir'] = os.path.join(os.path.dirname(os.path.abspath(path)), 'NUP_Export')
                 self.save_settings(self.settings)
+                if any(p.endswith('.fdata') for p in v.c.files):  # Koei Tecmo game: names, links of models
+                    def index(vfs=v):
+                        try:
+                            vfs.katana().data()
+                            if self.vfs is vfs:  # the UI shows the names and descriptions now
+                                self.emit('state', self.state_dict())
+                        except Exception:  # noqa: BLE001 - built again on demand
+                            self.log(traceback.format_exc())
+                    threading.Thread(target=index, name='katana-index', daemon=True).start()
             except Exception as e:  # noqa: BLE001
                 self.error = f'{type(e).__name__}: {e}'
                 self.log(traceback.format_exc())
@@ -124,7 +142,7 @@ class State:
         m = self.models.get(path)
         if m is None:
             raw = self.vfs.read(path)
-            m = bfres.parse_models(raw)
+            m = load_models(self.vfs, path, raw)
             self.models.put(path, m, len(raw))
         return m
 
@@ -141,7 +159,8 @@ class State:
         a = self.anims.get(path)
         if a is None:
             raw = self.vfs.read(path)
-            a = (A.parse_anims(raw), A.parse_vis_anims(raw), A.sections(raw))
+            name = path.rpartition('::')[2].rpartition('/')[2].rpartition('.')[0]  # one clip per G1A/G2A file
+            a = (A.parse_anims(raw, name), A.parse_vis_anims(raw), A.sections(raw))
             self.anims.put(path, a, len(raw))
         return a
 
@@ -217,7 +236,8 @@ def create_app(state: State) -> Flask:
             tok = request.headers.get('X-Token') or request.args.get('t') or ''
             if not secrets.compare_digest(tok, state.token):
                 abort(403)
-            if request.path not in ('/api/state', '/api/events', '/api/open', '/api/settings', '/api/pick-folder') \
+            if request.path not in ('/api/state', '/api/events', '/api/open', '/api/settings', '/api/pick-folder',
+                                    '/api/update/check', '/api/update/open') \
                     and state.vfs is None:
                 return jsonify({'error': 'No NUP file loaded'}), 409
 
@@ -294,8 +314,32 @@ def create_app(state: State) -> Flask:
             body = request.get_json(silent=True) or {}
             if 'export_dir' in body and body['export_dir']:
                 state.settings['export_dir'] = body['export_dir']
-                state.save_settings(state.settings)
-        return jsonify({'export_dir': state.settings.get('export_dir') or ''})
+            if isinstance(body.get('formats'), dict):
+                state.settings['formats'] = normalize_formats({**(state.settings.get('formats') or {}), **body['formats']})
+            if isinstance(body.get('check_updates'), bool):
+                state.settings['check_updates'] = body['check_updates']
+                if body['check_updates']:
+                    state.updates.wake()
+            state.save_settings(state.settings)
+            if 'check_updates' in body:
+                state.emit('state', state.state_dict())
+        return jsonify({'export_dir': state.settings.get('export_dir') or '',
+                        'formats': normalize_formats(state.settings.get('formats')), 'format_options': EXPORT_FORMATS})
+
+    @app.post('/api/update/check')
+    def api_update_check():
+        return jsonify(state.updates.check())
+
+    @app.post('/api/update/open')
+    def api_update_open():
+        """Opens the download, the release page or the project page in the default browser (only these links)."""
+        body = request.get_json(silent=True) or {}
+        latest = state.updates.status()['latest'] or {}
+        target = {'download': latest.get('download'), 'release': latest.get('page'), 'project': REPO_URL}.get(body.get('what'))
+        if not target:
+            return jsonify({'ok': False, 'error': 'No link available'}), 404
+        webbrowser.open(target)
+        return jsonify({'ok': True, 'url': target})
 
     @app.post('/api/pick-folder')
     def api_pick_folder():
@@ -337,9 +381,9 @@ def create_app(state: State) -> Flask:
         t = m['type']
         try:
             if t == 'texture':
-                m['textures'] = [x.to_dict() for x in textures.parse_bntx(v.read(path))]
+                m['textures'] = [x.to_dict() for x in textures.parse(v.read(path))]
             elif t == 'audio':
-                m['audio'] = audio.BwavInfo(v.read(path)).to_dict()
+                m['audio'] = audio.info(v.head(path, 0x1000)).to_dict()
             elif t == 'model':
                 models = state.get_models(path)
                 m['model'] = bfres.model_summary(models)
@@ -389,7 +433,7 @@ def create_app(state: State) -> Flask:
         png = state.png.get(key)
         if png is None:
             raw = v.read(path)
-            texs = textures.parse_bntx(raw)
+            texs = textures.parse(raw)
             t = texs[min(ti, len(texs) - 1)]
             if maxdim:
                 mip = max(mip, textures.choose_mip(t, maxdim))
@@ -408,13 +452,52 @@ def create_app(state: State) -> Flask:
         wav = state.wav.get(key)
         if wav is None:
             pcm, rate, info = audio.decode(state.vfs.read(path))
-            if mix == 'stereo' and pcm.shape[1] > 2:
-                f = pcm.astype(np.float32)
-                left = f[:, 0::2].mean(1)
-                right = f[:, 1::2].mean(1)
-                pcm = np.clip(np.stack([left, right], 1), -32768, 32767).astype(np.int16)
+            if mix == 'stereo':
+                pcm = audio.stereo_mix(pcm)
             wav = state.wav.put(key, audio.wav_bytes(pcm, rate))
         return binary(wav, 'audio/wav')
+
+    # ---------------------------------------------------------------- video
+    def video_source(path: str):
+        """(read(offset, length), size): videos the container stores unpacked are read in place, others
+        (compressed by the container, inside archives) are loaded once and kept until the next video."""
+        v = state.vfs
+        if '::' not in path and not v.c.is_packed(path):
+            return v.c.reader(path)
+        cached_path, data = state.video
+        if cached_path != path:
+            data = v.read(path)
+            state.video = (path, data)
+        return (lambda o, n: data[o:o + n]), len(data)
+
+    @app.get('/api/video')
+    def api_video():
+        """WebM stream with HTTP range requests (seeking), 8 MiB per request."""
+        read, size = video_source(arg('path'))
+        m = re.fullmatch(r'bytes=(\d*)-(\d*)', (request.headers.get('Range') or '').strip())
+        if not m:
+            def stream():
+                for o in range(0, size, 8 << 20):
+                    yield read(o, 8 << 20)
+            r = Response(stream(), mimetype='video/webm')
+            r.headers['Content-Length'] = str(size)
+            r.headers['Accept-Ranges'] = 'bytes'
+            return r
+        if m.group(1):
+            start = int(m.group(1))
+            end = int(m.group(2)) if m.group(2) else size - 1
+        else:  # suffix range: the last n bytes
+            start, end = max(0, size - int(m.group(2) or 0)), size - 1
+        end = min(end, start + (8 << 20) - 1, size - 1)
+        if start >= size or end < start:
+            r = Response(status=416)
+            r.headers['Content-Range'] = f'bytes */{size}'
+            return r
+        r = Response(read(start, end - start + 1), status=206, mimetype='video/webm')
+        r.headers['Content-Range'] = f'bytes {start}-{end}/{size}'
+        r.headers['Accept-Ranges'] = 'bytes'
+        r.headers['Cache-Control'] = 'no-store'
+        return r
 
     # ---------------------------------------------------------------- models & animations
     @app.get('/api/model.glb')
@@ -469,7 +552,8 @@ def create_app(state: State) -> Flask:
             except Exception:  # noqa: BLE001 - unreadable model: suggest by name only
                 bones = None
             suggested = v.anim_candidates(model, bones=bones)
-        return jsonify({'suggested': suggested, 'all': v.all_anims()})
+        labels = {p: lab for p in suggested if (lab := v.anim_label(p))}  # Koei Tecmo: hash names + length, bones
+        return jsonify({'suggested': suggested, 'all': v.all_anims(), 'labels': labels})
 
     # ---------------------------------------------------------------- text & data
     @app.get('/api/msbt')
@@ -525,7 +609,7 @@ def create_app(state: State) -> Flask:
     @app.get('/api/convert')
     def api_convert():
         path = arg('path')
-        items = convert_file(state.vfs, path, arg('fmt'))
+        items = convert_file(state.vfs, path, arg('fmt'), formats=state.settings.get('formats'))
         if len(items) == 1:
             n, d = items[0]
             return binary(d, mimetypes.guess_type(n)[0] or 'application/octet-stream', cache=False, filename=n)
@@ -549,7 +633,8 @@ def create_app(state: State) -> Flask:
             state.settings['export_dir'] = target
             state.save_settings(state.settings)
         os.makedirs(target, exist_ok=True)
-        st = state.export.start(state.vfs, state.cache_dir, paths, mode, target, bool(body.get('skip_existing')))
+        st = state.export.start(state.vfs, state.cache_dir, paths, mode, target, bool(body.get('skip_existing')),
+                                normalize_formats(state.settings.get('formats')))
         return jsonify({'ok': True, 'status': st})
 
     @app.post('/api/export/cancel')
@@ -559,10 +644,12 @@ def create_app(state: State) -> Flask:
 
     @app.post('/api/export/model-glb')
     def api_export_model_glb():
-        """GLB with embedded textures plus baked animations (one clip or all clips of a file)."""
+        """GLB with embedded textures plus baked animations: one clip ('anim' + 'clip'), all clips of a
+        file ('anim') or all clips of several files at once ('anims': [paths])."""
         body = request.get_json(silent=True) or {}
         model = body.get('model')
         anim_path = body.get('anim')
+        anim_paths = [p for p in (body.get('anims') or ([anim_path] if anim_path else [])) if p]
         clip = body.get('clip')
         target = state.settings.get('export_dir')
         if not target:
@@ -575,16 +662,23 @@ def create_app(state: State) -> Flask:
         if not models:
             return jsonify({'error': 'This file contains no model'}), 400
         clips = []
+        skipped = 0
         suffix = ''
-        if anim_path:
-            anims = state.get_anims(anim_path)
-            idxs = [int(clip)] if clip is not None else range(len(anims))
-            skel = models[0].skeleton
-            clips = [A.bake(anims[i], skel) for i in idxs if anims[i].rot_supported]
-            suffix = '.' + (anims[int(clip)].name if clip is not None else
-                            base_name(anim_path.rpartition('/')[2]).replace('.anim', ''))
+        skel = models[0].skeleton
+
+        def label(p):
+            return base_name(p.rpartition('/')[2]).replace('.anim', '')
+
+        if clip is not None and len(anim_paths) == 1:
+            a = state.get_anims(anim_paths[0])[int(clip)]
+            clips = [A.bake(a, skel)] if a.rot_supported else []
+            skipped = 0 if clips else 1
+            suffix = '.' + a.name
+        elif anim_paths:
+            clips, skipped = A.bake_files([(label(p), state.get_anims(p)) for p in anim_paths], skel)
+            suffix = '.' + (label(anim_paths[0]) if len(anim_paths) == 1 else 'all-animations')
         glb = gltf.build_glb(models, 0, texture_png=lambda n, k: texture_png_for_model(state.vfs, n, k, None, 6),
-                             animations=clips, extras={'source': model, 'animations_from': anim_path},
+                             animations=clips, extras={'source': model, 'animations_from': anim_paths},
                              fallback_color=lambda mt: ramp_color(state.vfs, mt))
         fname = base_name(model.rpartition('::')[2].rpartition('/')[2]) + suffix + '.glb'
         fname = re.sub(r'[<>:"/\\|?*]', '_', fname)
@@ -592,6 +686,7 @@ def create_app(state: State) -> Flask:
         out = os.path.join(target, fname)
         with open(out, 'wb') as f:
             f.write(glb)
-        return jsonify({'ok': True, 'path': out, 'clips': len(clips), 'size': len(glb)})
+        return jsonify({'ok': True, 'path': out, 'clips': len(clips), 'files': len(anim_paths),
+                        'skipped': skipped, 'size': len(glb)})
 
     return app

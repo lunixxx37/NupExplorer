@@ -1,4 +1,4 @@
-// Audio player (WebAudio): waveform, seeking, loop points from the BWAV header.
+// Audio player (WebAudio): waveform, seeking, loop points from the file header (BWAV, KA1A).
 import { el, formatTime, getBinary } from '../api.js';
 import { icon } from '../icons.js';
 

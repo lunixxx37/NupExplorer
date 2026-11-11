@@ -5,11 +5,12 @@ import { icon, TYPES } from './icons.js';
 const ROW = 28;
 
 export class Tree {
-  constructor(container, { load, onSelect, onContext }) {
+  constructor(container, { load, onSelect, onContext, onOpenInTree }) {
     this.el = container;
     this.load = load;
     this.onSelect = onSelect;
     this.onContext = onContext;
+    this.onOpenInTree = onOpenInTree; // search results: expanding a folder/archive opens it in the normal tree
     this.roots = [];
     this.rows = [];
     this.flat = null;           // search results mode
@@ -100,8 +101,16 @@ export class Tree {
     const ic = icon(TYPES[type].icon, `t-${type}`);
     const nm = document.createElement('span');
     nm.className = 'name';
-    nm.textContent = n.showPath ? n.path : n.name;
-    nm.title = n.path;
+    // Koei Tecmo files are only named by hashes: a real name (title) replaces the hash, a description follows it
+    nm.textContent = n.title || (n.showPath ? n.path : n.name);
+    const extra = n.title ? (n.showPath ? n.path : n.name) : n.desc;
+    if (extra) {
+      const d = document.createElement('span');
+      d.className = 'desc';
+      d.textContent = extra;
+      nm.append(d);
+    }
+    nm.title = n.path + (n.desc ? `\n${n.desc}` : '');
     const meta = document.createElement('span');
     meta.className = 'meta';
     meta.textContent = n.kind === 'dir' ? (n.count ?? '') : formatSize(n.size);
@@ -141,6 +150,11 @@ export class Tree {
   async toggle(n, force) {
     if (!n.expandable) return;
     const want = force ?? !n.expanded;
+    if (this.flat) {
+      // search results have no children: open the folder/archive in the normal tree instead
+      if (want && this.onOpenInTree) this.onOpenInTree(n);
+      return;
+    }
     if (want && !n.loaded) {
       n.loading = true;
       this.render();
@@ -156,10 +170,6 @@ export class Tree {
       n.loading = false;
     }
     n.expanded = want;
-    if (this.flat) {
-      // in search mode: open the folder in the normal tree instead
-      return;
-    }
     this.refresh();
   }
 
@@ -208,6 +218,28 @@ export class Tree {
         break;
       default:
     }
+  }
+
+  // Names and descriptions arrived (Koei Tecmo index ready): update the loaded nodes in place.
+  async updateLabels() {
+    const apply = (nodes, items) => {
+      const byPath = new Map(items.map((it) => [it.path, it]));
+      for (const n of nodes) {
+        const it = byPath.get(n.path);
+        if (it) { n.title = it.title; n.desc = it.desc; }
+      }
+    };
+    apply(this.roots, await this.load(''));
+    const walk = async (nodes) => {
+      for (const n of nodes) {
+        if (n.loaded && n.children.length) {
+          apply(n.children, await this.load(n.path));
+          await walk(n.children);
+        }
+      }
+    };
+    await walk(this.roots);
+    this.render();
   }
 
   // Reveal a path in the normal tree (expands parents step by step).

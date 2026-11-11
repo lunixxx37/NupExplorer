@@ -28,11 +28,14 @@ own rotation/scale, but its translation is still scaled by the parent.
 """
 from __future__ import annotations
 
+import collections
 import json
 import math
 import struct
 
 import numpy as np
+
+from . import g2a
 
 FPS = 30.0
 _TARGETS = {0x04: ('s', 0), 0x08: ('s', 1), 0x0C: ('s', 2),
@@ -189,6 +192,8 @@ SECTIONS = ((0x58, 'skeletal'), (0x68, 'material'), (0x78, 'bone visibility'), (
 def sections(raw: bytes) -> dict[str, int]:
     """Number of animations per kind, e.g. {'skeletal': 40} or {'material': 2}."""
     out = {}
+    if g2a.is_anim(raw):  # Koei Tecmo: one skeletal clip per file
+        return {'skeletal': 1}
     if raw[:4] != b'FRES':
         return out
     for off, name in SECTIONS:
@@ -202,6 +207,8 @@ def sections(raw: bytes) -> dict[str, int]:
 def skeletal_bone_names(raw: bytes, max_clips: int = 8) -> set[str]:
     """Bones animated by the first clips of a file (cheap: no curves are decoded)."""
     names = set()
+    if g2a.is_anim(raw):
+        return {b.name for b in g2a.parse(raw)[0].bones}
     if raw[:4] != b'FRES':
         return names
     arr, dic = struct.unpack_from('<QQ', raw, 0x58)
@@ -217,10 +224,15 @@ def skeletal_bone_names(raw: bytes, max_clips: int = 8) -> set[str]:
 
 def has_skeletal(head: bytes) -> bool:
     """From the first 0x60 bytes of a BFRES file: does it contain skeletal animations?"""
+    if g2a.is_anim(head):
+        return True
     return head[:4] == b'FRES' and len(head) >= 0x60 and struct.unpack_from('<Q', head, 0x58)[0] != 0
 
 
-def parse_anims(raw: bytes) -> list[SkelAnim]:
+def parse_anims(raw: bytes, name: str = 'clip') -> list:
+    """Skeletal clips of a BFRES file (SkelAnim) or of a Koei Tecmo G1A/G2A file (g2a.Clip, named name)."""
+    if g2a.is_anim(raw):
+        return g2a.parse(raw, name)
     if raw[:4] != b'FRES':
         raise ValueError('Not a BFRES file')
     arr, dic = struct.unpack_from('<QQ', raw, 0x58)
@@ -292,6 +304,8 @@ def bake(anim: SkelAnim, skeleton=None) -> tuple[dict, np.ndarray]:
     skeleton: optional bfres.Skeleton for bind-pose fallbacks and segment scale compensation.
     Returns (header, data) where data is float32 (bones, frames, 10) = t3, q4, s3.
     """
+    if hasattr(anim, 'bake'):  # Koei Tecmo clips evaluate themselves (g2a.py)
+        return anim.bake(skeleton)
     nf = max(1, int(math.ceil(anim.frame_count)) + 1)
     t = np.arange(nf, dtype=np.float64)
     warnings = []
@@ -453,6 +467,35 @@ def parse_vis_anims(raw: bytes) -> list[VisAnim]:
             va.curves.append((tgt, frames, vals))
         out.append(va)
     return out
+
+
+def bake_files(sources: list[tuple[str, list[SkelAnim]]], skeleton=None) -> tuple[list[tuple[dict, np.ndarray]], int]:
+    """Bake every clip of one or more animation files for a single export.
+
+    sources: [(file label, clips of that file), ...]. A clip name that occurs in more than one file gets
+    the file label as prefix (DriverA_Yoshi_Kart.KartTrickStraight_B), so all animations keep unique names.
+    Returns ([(header, data), ...], number of clips skipped because their rotation mode is unsupported)."""
+    baked, skipped = [], 0
+    for label, anims in sources:
+        for a in anims:
+            if not a.rot_supported:
+                skipped += 1
+                continue
+            header, data = bake(a, skeleton)
+            baked.append((label, header, data))
+    counts = collections.Counter(h['name'] for _, h, _ in baked)
+    used = set()
+    out = []
+    for label, h, d in baked:
+        name = f'{label}.{h["name"]}' if counts[h['name']] > 1 and len(sources) > 1 else h['name']
+        unique, k = name, 2
+        while unique in used:  # same name twice in one file
+            unique = f'{name}.{k}'
+            k += 1
+        used.add(unique)
+        h['name'] = unique
+        out.append((h, d))
+    return out, skipped
 
 
 def clip_list(anims: list[SkelAnim]) -> list[dict]:

@@ -48,7 +48,7 @@ class Dialogs:
 
     def pick_file(self, title='Open NUP file', initialdir=None):
         return self.ask('file', title=title, initialdir=initialdir,
-                        filetypes=[('NUP container', '*.nup'), ('All files', '*.*')])
+                        filetypes=[('NUP container', '*.nup *.nup.db'), ('All files', '*.*')])
 
     def pick_folder(self, title='Choose export folder', initialdir=None):
         return self.ask('folder', title=title, initialdir=initialdir, mustexist=False)

@@ -1,4 +1,4 @@
-"""BWAV audio (Nintendo): PCM16, DSP-ADPCM and Nintendo Opus.
+"""Audio: BWAV (Nintendo: PCM16, DSP-ADPCM and Nintendo Opus) and KA1A (Koei Tecmo, see ka1a.py).
 
 Header: "BWAV", BOM, u16 version, u32 crc, u16 prefetch, u16 channels, then per channel 0x4C bytes:
   +0x00 u16 codec (0 PCM16, 1 DSP-ADPCM, 2 Opus), +0x02 u16 pan, +0x04 u32 rate,
@@ -18,6 +18,8 @@ import wave
 from array import array
 
 import numpy as np
+
+from . import ka1a
 
 CODECS = {0: 'PCM16', 1: 'DSP-ADPCM', 2: 'Opus'}
 
@@ -172,8 +174,21 @@ def _opus_decode(data: bytes, off: int, nsamples: int) -> np.ndarray:
 
 
 # ------------------------------------------------------------------ public API
-def decode(data: bytes) -> tuple[np.ndarray, int, BwavInfo]:
+def info(data: bytes):
+    """Header information of a BWAV or KA1A file (the first 0x1000 bytes are enough); .to_dict() for the UI."""
+    return ka1a.Info(data) if data[:4] == ka1a.MAGIC else BwavInfo(data)
+
+
+def to_int16(pcm: np.ndarray) -> np.ndarray:
+    """Float samples (-1..1) -> int16, clipped."""
+    return np.clip(np.rint(pcm * 32768.0), -32768, 32767).astype(np.int16)
+
+
+def decode(data: bytes):
     """Return (pcm int16 [n, channels], rate, info)."""
+    if data[:4] == ka1a.MAGIC:
+        pcm, rate, inf = ka1a.decode_file(data)
+        return to_int16(pcm), rate, inf
     info = BwavInfo(data)
     chans = []
     for c in info.ch:
@@ -202,3 +217,41 @@ def wav_bytes(pcm: np.ndarray, rate: int) -> bytes:
         w.setframerate(rate)
         w.writeframes(np.ascontiguousarray(pcm, dtype='<i2').tobytes())
     return bio.getvalue()
+
+
+# export formats: key -> (label, extension)
+FORMATS = {'wav': ('WAV', '.wav'), 'flac': ('FLAC (lossless, smaller)', '.flac'),
+           'mp3': ('MP3 (320 kbps, max. stereo)', '.mp3'), 'ogg': ('OGG Vorbis (~170 kbps)', '.ogg')}
+
+
+def stereo_mix(pcm: np.ndarray) -> np.ndarray:
+    """More than two channels -> stereo (even channels left, odd channels right)."""
+    if pcm.shape[1] <= 2:
+        return pcm
+    f = pcm.astype(np.float32)
+    return np.clip(np.stack([f[:, 0::2].mean(1), f[:, 1::2].mean(1)], 1), -32768, 32767).astype(np.int16)
+
+
+def _sf_encode(pcm: np.ndarray, rate: int, container: str, subtype: str, **kw) -> bytes:
+    """Encode with libsndfile in blocks: its Vorbis encoder overflows the stack on Windows when it
+    gets a whole track in one call."""
+    import soundfile as sf
+    bio = io.BytesIO()
+    with sf.SoundFile(bio, 'w', rate, pcm.shape[1], subtype=subtype, format=container, **kw) as f:
+        for i in range(0, len(pcm), 16384):
+            f.write(pcm[i:i + 16384])
+    return bio.getvalue()
+
+
+def encode(pcm: np.ndarray, rate: int, fmt: str = 'wav') -> tuple[str, bytes]:
+    """(file extension, bytes) of the PCM in an export format (see FORMATS)."""
+    if fmt == 'wav':
+        return '.wav', wav_bytes(pcm, rate)
+    if fmt == 'flac':
+        return '.flac', _sf_encode(pcm, rate, 'FLAC', 'PCM_16')
+    if fmt == 'mp3':  # MP3 has at most two channels
+        return '.mp3', _sf_encode(stereo_mix(pcm), rate, 'MP3', 'MPEG_LAYER_III',
+                                  bitrate_mode='CONSTANT', compression_level=0.0)
+    if fmt == 'ogg':
+        return '.ogg', _sf_encode(pcm, rate, 'OGG', 'VORBIS', compression_level=0.4)
+    raise ValueError(f'Unknown audio format: {fmt}')

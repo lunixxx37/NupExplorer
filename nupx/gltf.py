@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import re
 import struct
+import urllib.parse
 
 import numpy as np
 
@@ -46,7 +47,7 @@ class GlbBuilder:
         self.gltf['accessors'].append(acc)
         return len(self.gltf['accessors']) - 1
 
-    def finish(self) -> bytes:
+    def _finalize(self, bin_uri: str | None = None) -> bytes:
         g = self.gltf
         for k in ('materials', 'textures', 'images', 'samplers', 'skins', 'animations', 'meshes'):
             if not g[k]:
@@ -54,11 +55,20 @@ class GlbBuilder:
         while len(self.bin) % 4:
             self.bin.append(0)
         g['buffers'][0]['byteLength'] = len(self.bin)
-        js = json.dumps(g, separators=(',', ':')).encode('utf-8')
+        if bin_uri:
+            g['buffers'][0]['uri'] = bin_uri
+        return json.dumps(g, separators=(',', ':')).encode('utf-8')
+
+    def finish(self) -> bytes:
+        js = self._finalize()
         js += b' ' * ((-len(js)) % 4)
         total = 12 + 8 + len(js) + 8 + len(self.bin)
         return (struct.pack('<4sII', b'glTF', 2, total) + struct.pack('<I4s', len(js), b'JSON') + js
                 + struct.pack('<I4s', len(self.bin), b'BIN\x00') + bytes(self.bin))
+
+    def finish_separate(self, bin_uri: str) -> tuple[bytes, bytes]:
+        """(.gltf JSON, .bin) for a glTF with external files."""
+        return self._finalize(bin_uri), bytes(self.bin)
 
 
 # untextured surfaces the game draws with special shaders (refraction, liquids): shown translucent
@@ -88,6 +98,22 @@ def _shader_color(mat: B.Material, mode: str | None, ramp: list[float] | None):
     return (col + [1.0]) if col else list(_GREY), False
 
 
+def texture_label(name: str) -> str:
+    """Short texture name: textures named by a path (Koei Tecmo G1T files) -> the file name without extension."""
+    if '::' in name or '/' in name:
+        name = name.rpartition('::')[2].rpartition('/')[2]
+        name = name[:-4] if name.lower().endswith('.g1t') else name
+    return name
+
+
+def texture_file_name(name: str, kind: str) -> str:
+    """File name for an exported texture (glTF/OBJ with external files)."""
+    if kind == 'eye':
+        name = 'Eye_' + name.split('|')[0]
+    stem = re.sub(r'[^A-Za-z0-9_.-]', '_', texture_label(name))
+    return f'{stem}_normal.png' if kind == 'normal' else f'{stem}.png'
+
+
 def build_glb(models: list[B.Model], lod: int = 0, texture_uri=None, texture_png=None,
               animations=None, extras: dict | None = None, fallback_color=None) -> bytes:
     """texture_uri(name, kind) -> uri | None   (viewer: textures loaded via HTTP)
@@ -95,6 +121,21 @@ def build_glb(models: list[B.Model], lod: int = 0, texture_uri=None, texture_png
     kind: 'color', 'normal' or 'eye' (name = 'iris|sclera|mask', composited)
     fallback_color(material) -> [r, g, b] linear | None   (colour when no albedo texture exists)
     animations: list of (header, data) from anim.bake for the first model's skeleton."""
+    return _build(models, lod, texture_uri, texture_png, animations, extras, fallback_color).finish()
+
+
+def build_gltf(models: list[B.Model], name: str, lod: int = 0, texture_png=None, animations=None,
+               extras: dict | None = None, fallback_color=None) -> list[tuple[str, bytes]]:
+    """glTF with external files: [(name.gltf, ...), (name.bin, ...), (name_textures/X.png, ...), ...]."""
+    images: dict[str, bytes] = {}
+    gb = _build(models, lod, None, texture_png, animations, extras, fallback_color,
+                image_files=(f'{name}_textures', images))
+    js, binary = gb.finish_separate(urllib.parse.quote(f'{name}.bin'))
+    return [(f'{name}.gltf', js), (f'{name}.bin', binary)] + list(images.items())
+
+
+def _build(models, lod, texture_uri, texture_png, animations, extras, fallback_color, image_files=None) -> GlbBuilder:
+    """image_files = (folder, {path: png}): textures become external PNG files instead of being embedded."""
     gb = GlbBuilder()
     g = gb.gltf
     g['samplers'].append({'magFilter': 9729, 'minFilter': 9987, 'wrapS': 10497, 'wrapT': 10497})
@@ -112,8 +153,14 @@ def build_glb(models: list[B.Model], lod: int = 0, texture_uri=None, texture_png
             r = texture_png(name, kind)
             if r:
                 png, alpha = r
-                g['images'].append({'bufferView': gb.view(png), 'mimeType': 'image/png', 'name': name})
-                g['textures'].append({'source': len(g['images']) - 1, 'sampler': 0, 'name': name})
+                label = texture_label(name)
+                if image_files is not None:  # external file next to the .gltf
+                    path = f'{image_files[0]}/{texture_file_name(name, kind)}'
+                    image_files[1][path] = png
+                    g['images'].append({'uri': urllib.parse.quote(path), 'name': label})
+                else:
+                    g['images'].append({'bufferView': gb.view(png), 'mimeType': 'image/png', 'name': label})
+                g['textures'].append({'source': len(g['images']) - 1, 'sampler': 0, 'name': label})
                 res = (len(g['textures']) - 1, alpha)
         elif texture_uri is not None:
             uri = texture_uri(name, kind)
@@ -155,8 +202,9 @@ def build_glb(models: list[B.Model], lod: int = 0, texture_uri=None, texture_png
             scene_extras['bones'] = [b.name for b in skel.bones] if skel else []
         mat_index = {}
         shapes_info = []
+        geometry = getattr(model, 'geometry', None)  # G1M models build their own geometry
         for s in model.shapes:
-            geo = B.shape_geometry(model, s, lod)
+            geo = geometry(s, lod) if geometry is not None else B.shape_geometry(model, s, lod)
             if geo is None:
                 continue
             mat = model.materials[s.material] if s.material < len(model.materials) else None
@@ -236,6 +284,7 @@ def build_glb(models: list[B.Model], lod: int = 0, texture_uri=None, texture_png
                                 and not shadow_only,
                                 'shadow_only': shadow_only})
         scene_extras['models'].append({'name': model.name, 'shapes': shapes_info, 'lod_count': model.lod_count,
+                                       'skipped': list(getattr(model, 'skipped_meshes', [])),
                                        'bone_nodes': bone_nodes, 'compressed_geometry': model.compressed_geometry,
                                        'cluster_errors': [f'{s.name}: {s.cluster_error}' for s in model.shapes
                                                           if s.cluster_error]})
@@ -244,7 +293,7 @@ def build_glb(models: list[B.Model], lod: int = 0, texture_uri=None, texture_png
     if extras:
         scene_extras.update(extras)
     g['scenes'][0]['extras'] = scene_extras
-    return gb.finish()
+    return gb
 
 
 def _add_animations(gb: GlbBuilder, skel: B.Skeleton, bone_nodes: list[int], animations):

@@ -40,7 +40,7 @@ except ImportError:  # fallback: zstandard package
     def _zstd_unpack(data: bytes) -> bytes:
         return _zs.ZstdDecompressor().decompressobj().decompress(data)
 
-INDEX_VERSION = 2
+INDEX_VERSION = 3  # 3: files the update repeats unchanged count as base game files
 
 _DIR_DT = np.dtype([('name_off', '<u4'), ('name_len', '<u4'), ('child_start', '<u4'),
                     ('child_count', '<u4'), ('reserved', '<u8')])
@@ -131,6 +131,7 @@ class NupContainer:
                   for o, n in zip(files['name_off'].tolist(), files['name_len'].tolist())]
         f_off = files['offset'].tolist()
         f_size = files['size'].tolist()
+        f_sha = files['sha'].tolist()
         cs = dirs['child_start'].tolist()
         cc = dirs['child_count'].tolist()
         ndir = self.ndir
@@ -148,8 +149,12 @@ class NupContainer:
                         stack.append((c, prefix + d_name[c] + '/'))
                     else:
                         fi = c - ndir
-                        # later sections (the update) override earlier ones
-                        merged[prefix + f_name[fi]] = (f_off[fi], f_size[fi], fi, li)
+                        path = prefix + f_name[fi]
+                        prev = merged.get(path)
+                        # later sections (the update) override earlier ones; an update that repeats a file
+                        # unchanged (same SHA-256) leaves it a base game file
+                        if prev is None or f_sha[prev[2]] != f_sha[fi]:
+                            merged[path] = (f_off[fi], f_size[fi], fi, li)
         self.files = merged
         # directory listing of the merged view
         tmp: dict[str, tuple[set, list]] = {'': (set(), [])}
@@ -196,6 +201,18 @@ class NupContainer:
         if _ZstdDecompressor is None:
             return _zstd_unpack(self._mm[off:off + stored])[:n]
         return _ZstdDecompressor().decompress(part, max_length=n)
+
+    def reader(self, vpath: str):
+        """(read(offset, length), size) for a file stored unpacked: reads straight from the mapped file."""
+        off, size, _fi, _li = self.files[vpath]
+        if self.is_packed(vpath):
+            raise ValueError(f'{vpath} is stored compressed')
+        mm = self._mm
+
+        def read(o: int, n: int) -> bytes:
+            o = max(0, min(o, size))
+            return mm[off + o:off + min(size, o + n)]
+        return read, size
 
     def is_packed(self, vpath: str) -> bool:
         """True if the container stores this file zstd-compressed (record compression 1)."""

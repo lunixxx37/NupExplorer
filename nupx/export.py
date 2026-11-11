@@ -1,4 +1,4 @@
-"""Batch export into a folder: converted (PNG/WAV/GLB/JSON/YAML) or raw (decompressed).
+"""Batch export into a folder: converted (formats per file type, see convert.EXPORT_FORMATS) or raw (decompressed).
 
 Large jobs run in a process pool (spawn); every worker opens its own VFS (index from cache).
 Archives are exported as folders named like the archive (without .zs).
@@ -39,12 +39,12 @@ def out_dir_for(target: str, vpath: str) -> str:
     return os.path.join(target, *rel)
 
 
-def _write_items(vfs: VFS, vpath: str, mode: str, target: str, skip: bool) -> int:
-    name = vpath.rpartition('::')[2].rpartition('/')[2]
+def _write_items(vfs: VFS, vpath: str, mode: str, target: str, skip: bool, formats: dict | None = None) -> int:
+    name = vfs.export_name(vpath)
     if mode == 'raw':
         items = [(raw_name(name), vfs.read(vpath))]
     else:
-        items = convert_file(vfs, vpath)
+        items = convert_file(vfs, vpath, formats=formats)
     d = out_dir_for(target, vpath)
     n = 0
     for fname, data in items:
@@ -59,7 +59,7 @@ def _write_items(vfs: VFS, vpath: str, mode: str, target: str, skip: bool) -> in
 
 
 def run_task(vfs: VFS, task: tuple) -> tuple:
-    kind, vpath, mode, target, skip = task
+    kind, vpath, mode, target, skip, formats = task
     written = 0
     errors = []
     try:
@@ -69,15 +69,15 @@ def run_task(vfs: VFS, task: tuple) -> tuple:
                 mp = f'{vpath}::{member}'
                 try:
                     if classify(member) == 'archive':
-                        w, e = run_task(vfs, ('archive', mp, mode, target, skip))[1:3]
+                        w, e = run_task(vfs, ('archive', mp, mode, target, skip, formats))[1:3]
                         written += w
                         errors += e
                     else:
-                        written += _write_items(vfs, mp, mode, target, skip)
+                        written += _write_items(vfs, mp, mode, target, skip, formats)
                 except Exception as e:  # noqa: BLE001
                     errors.append((mp, f'{type(e).__name__}: {e}'))
         else:
-            written += _write_items(vfs, vpath, mode, target, skip)
+            written += _write_items(vfs, vpath, mode, target, skip, formats)
     except Exception as e:  # noqa: BLE001
         errors.append((vpath, f'{type(e).__name__}: {e}'))
     return vpath, written, errors
@@ -87,17 +87,17 @@ def _worker_task(task: tuple) -> tuple:
     return run_task(_W['vfs'], task)
 
 
-def expand(vfs: VFS, paths: list[str], mode: str, target: str, skip: bool) -> list[tuple]:
+def expand(vfs: VFS, paths: list[str], mode: str, target: str, skip: bool, formats: dict | None = None) -> list[tuple]:
     tasks = []
     seen = set()
 
     def add(kind, p):
         if (kind, p) not in seen:
             seen.add((kind, p))
-            tasks.append((kind, p, mode, target, skip))
+            tasks.append((kind, p, mode, target, skip, formats))
 
     def add_file(p):
-        if mode == 'convert' and classify(p) == 'archive':
+        if mode == 'convert' and vfs.type_of(p) == 'archive':
             add('archive', p)
         else:
             add('file', p)
@@ -144,7 +144,8 @@ class ExportManager:
             except Exception:  # noqa: BLE001
                 pass
 
-    def start(self, vfs: VFS, cache_dir: str | None, paths: list[str], mode: str, target: str, skip: bool) -> dict:
+    def start(self, vfs: VFS, cache_dir: str | None, paths: list[str], mode: str, target: str, skip: bool,
+              formats: dict | None = None) -> dict:
         with self.lock:
             if self.state.get('running'):
                 raise RuntimeError('An export is already running')
@@ -152,7 +153,7 @@ class ExportManager:
             self.state = {'running': True, 'mode': mode, 'target': target, 'done': 0, 'total': 0, 'written': 0,
                           'errors': 0, 'current': 'Collecting files…', 'started': time.time(),
                           'finished': False, 'cancelled': False}
-        threading.Thread(target=self._run, args=(vfs, cache_dir, paths, mode, target, skip),
+        threading.Thread(target=self._run, args=(vfs, cache_dir, paths, mode, target, skip, formats),
                          name='export', daemon=True).start()
         return self.status()
 
@@ -162,10 +163,10 @@ class ExportManager:
             self._last_pub = now
             self.emit('export', self.status())
 
-    def _run(self, vfs, cache_dir, paths, mode, target, skip):
+    def _run(self, vfs, cache_dir, paths, mode, target, skip, formats):
         errors_all = []
         try:
-            tasks = expand(vfs, paths, mode, target, skip)
+            tasks = expand(vfs, paths, mode, target, skip, formats)
             with self.lock:
                 self.state['total'] = len(tasks)
             self._publish(True)
